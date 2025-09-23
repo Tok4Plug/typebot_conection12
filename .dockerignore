@@ -1,10 +1,26 @@
+# ============================
+# Arquivos temporários / cache
+# ============================
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 *.log
+
+# ============================
+# Configurações locais
+# ============================
 .env
 .git
 .gitignore
 .vscode/
 .idea/
+
+# ============================
+# ⚠️ IMPORTANTE
+# Nunca ignore estas pastas:
+# ============================
+!bot_gesto/
+!bot_gesto/**
+!typebot_conection/
+!typebot_conection/**
