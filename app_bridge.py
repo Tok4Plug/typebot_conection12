@@ -1,8 +1,8 @@
 # =============================
-# app_bridge.py — versão 2.7 estável (auto-sync com bot_gesto)
+# app_bridge.py — v2.7 (auto-sync com bot_gesto, robusto)
 # =============================
 import os, sys, json, time, secrets, logging, asyncio, base64, hashlib, importlib.util
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -31,121 +31,153 @@ _ch.setFormatter(JSONFormatter())
 logger.addHandler(_ch)
 
 # =============================
-# Descoberta/import do bot_gesto
+# Descoberta + import dinâmico do bot_gesto
 # =============================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))    # geralmente /app no container
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))   # ex.: /app
 PARENT_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
 CWD_DIR = os.getcwd()
-ENV_DIR = os.getenv("BRIDGE_BOT_DIR")  # opcional: caminho absoluto de bot_gesto
-PKG_NAME = "bot_gesto"
+ENV_DIR = os.getenv("BRIDGE_BOT_DIR")  # opcional: /app/bot_gesto
 
-def _ls(path: str) -> Dict[str, Any]:
-    out = {"path": path, "exists": os.path.isdir(path)}
+def _ls(path: Optional[str]) -> Dict[str, Any]:
     try:
-        out["entries"] = sorted(os.listdir(path))[:120]
+        if not path: 
+            return {"path": path, "exists": False}
+        return {"path": path, "exists": os.path.isdir(path), "entries": sorted(os.listdir(path))[:80]}
     except Exception as e:
-        out["error"] = str(e)
-    return out
+        return {"path": path, "exists": False, "error": str(e)}
 
-def _files_ok(d: str) -> bool:
-    return os.path.isfile(os.path.join(d, "db.py")) and os.path.isfile(os.path.join(d, "fb_google.py"))
+def _first_existing(paths: List[str]) -> Optional[str]:
+    for p in paths:
+        if p and os.path.isdir(p):
+            return p
+    return None
 
-def _import_by_file(dir_path: str):
-    def _imp(modname: str, fp: str):
-        spec = importlib.util.spec_from_file_location(modname, fp)
-        if not spec or not spec.loader:
-            raise ImportError(f"spec loader inválido para {fp}")
-        m = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(m)  # type: ignore[attr-defined]
-        return m
-    db_mod = _imp("_bridge_db", os.path.join(dir_path, "db.py"))
-    fb_mod = _imp("_bridge_fb_google", os.path.join(dir_path, "fb_google.py"))
-    return db_mod.save_lead, fb_mod.send_event_to_all
+def _find_module_file(root: str, name: str) -> Optional[str]:
+    """
+    Procura tanto name.py quanto name/__init__.py
+    """
+    candidates = [
+        os.path.join(root, f"{name}.py"),
+        os.path.join(root, name, "__init__.py"),
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return None
 
-IMPORT_DEBUG: Dict[str, Any] = {
-    "event": "IMPORT_STATUS",
-    "base_dir": BASE_DIR,
-    "parent_dir": PARENT_DIR,
-    "cwd": CWD_DIR,
+def _import_from_file(modname: str, filepath: str):
+    spec = importlib.util.spec_from_file_location(modname, filepath)
+    if not spec or not spec.loader:
+        raise ImportError(f"spec loader inválido para {filepath}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[attr-defined]
+    return module
+
+IMPORT_INFO: Dict[str, Any] = {
     "strategy": None,
+    "base_dir": BASE_DIR,
+    "env_dir": ENV_DIR,
+    "candidates": [],
     "chosen_dir": None,
-    "db_exists": None,
-    "fb_exists": None,
+    "db_file": None,
+    "fb_file": None,
     "errors": [],
-    "ls_base": _ls(BASE_DIR),
 }
 
-# 0) se BRIDGE_BOT_DIR foi setado, tenta direto por arquivo
-if ENV_DIR and os.path.isdir(ENV_DIR) and _files_ok(ENV_DIR):
-    try:
-        save_lead, send_event_to_all = _import_by_file(ENV_DIR)
-        IMPORT_DEBUG.update({
-            "strategy": "env_dir_file_import",
-            "chosen_dir": ENV_DIR,
-            "db_exists": True,
-            "fb_exists": True
-        })
-    except Exception as e:
-        IMPORT_DEBUG["errors"].append(f"env_dir_file_import: {e}")
+# Garanta que o BASE_DIR esteja no sys.path (import por pacote)
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
 
-# 1) tenta importar como pacote local: from bot_gesto import ...
-if "save_lead" not in globals():
-    if BASE_DIR not in sys.path:
-        sys.path.append(BASE_DIR)
-    try:
-        from bot_gesto.db import save_lead  # type: ignore
-        from bot_gesto.fb_google import send_event_to_all  # type: ignore
-        IMPORT_DEBUG.update({
-            "strategy": "package_import_bot_gesto",
-            "chosen_dir": os.path.join(BASE_DIR, PKG_NAME),
-            "db_exists": os.path.isfile(os.path.join(BASE_DIR, PKG_NAME, "db.py")),
-            "fb_exists": os.path.isfile(os.path.join(BASE_DIR, PKG_NAME, "fb_google.py"))
-        })
-    except Exception as e:
-        IMPORT_DEBUG["errors"].append(f"package_import_bot_gesto: {e}")
+save_lead = None  # será atribuído
+send_event_to_all = None
 
-# 2) se falhou, tenta importar via arquivo procurando em alguns lugares comuns
-if "save_lead" not in globals():
+# 1) Import por pacote: bot_gesto
+try:
+    from bot_gesto import db as _db_pkg  # type: ignore
+    from bot_gesto import fb_google as _fb_pkg  # type: ignore
+    save_lead = getattr(_db_pkg, "save_lead")
+    send_event_to_all = getattr(_fb_pkg, "send_event_to_all")
+    IMPORT_INFO.update({
+        "strategy": "pkg:bot_gesto",
+        "chosen_dir": os.path.join(BASE_DIR, "bot_gesto"),
+        "db_file": "package:bot_gesto.db",
+        "fb_file": "package:bot_gesto.fb_google",
+    })
+except Exception as e1:
+    IMPORT_INFO["errors"].append(f"pkg bot_gesto: {e1}")
+
+# 2) Import por pacote: typebot_conection.bot_gesto
+if save_lead is None or send_event_to_all is None:
+    try:
+        # deixa pai no sys.path para permitir 'typebot_conection'
+        if PARENT_DIR not in sys.path:
+            sys.path.insert(0, PARENT_DIR)
+        from typebot_conection.bot_gesto import db as _db_pkg2  # type: ignore
+        from typebot_conection.bot_gesto import fb_google as _fb_pkg2  # type: ignore
+        save_lead = getattr(_db_pkg2, "save_lead")
+        send_event_to_all = getattr(_fb_pkg2, "send_event_to_all")
+        IMPORT_INFO.update({
+            "strategy": "pkg:typebot_conection.bot_gesto",
+            "chosen_dir": os.path.join(BASE_DIR, "typebot_conection", "bot_gesto"),
+            "db_file": "package:typebot_conection.bot_gesto.db",
+            "fb_file": "package:typebot_conection.bot_gesto.fb_google",
+        })
+    except Exception as e2:
+        IMPORT_INFO["errors"].append(f"pkg typebot_conection.bot_gesto: {e2}")
+
+# 3) Import por arquivo direto (com suporte a db.py OU db/__init__.py)
+if save_lead is None or send_event_to_all is None:
     candidates = [
-        os.path.join(BASE_DIR, PKG_NAME),
-        os.path.join(BASE_DIR, "typebot_conection", PKG_NAME),
-        os.path.join(PARENT_DIR, PKG_NAME),
-        os.path.join(PARENT_DIR, "typebot_conection", PKG_NAME),
-        os.path.join(CWD_DIR, PKG_NAME),
-        os.path.join(CWD_DIR, "typebot_conection", PKG_NAME),
+        ENV_DIR,
+        os.path.join(BASE_DIR, "bot_gesto"),
+        os.path.join(BASE_DIR, "typebot_conection", "bot_gesto"),
+        os.path.join(CWD_DIR, "bot_gesto"),
+        os.path.join(CWD_DIR, "typebot_conection", "bot_gesto"),
+        os.path.join(PARENT_DIR, "bot_gesto"),
+        os.path.join(PARENT_DIR, "typebot_conection", "bot_gesto"),
     ]
-    chosen = None
-    for d in candidates:
-        if os.path.isdir(d) and _files_ok(d):
-            chosen = d
-            break
+    IMPORT_INFO["candidates"] = candidates
 
+    chosen = _first_existing([p for p in candidates if p])
     if chosen:
-        try:
-            save_lead, send_event_to_all = _import_by_file(chosen)
-            IMPORT_DEBUG.update({
-                "strategy": "file_import_candidates",
-                "chosen_dir": chosen,
-                "db_exists": True,
-                "fb_exists": True
-            })
-        except Exception as e:
-            IMPORT_DEBUG["errors"].append(f"file_import_candidates: {e}")
+        db_file = _find_module_file(chosen, "db")
+        fb_file = _find_module_file(chosen, "fb_google")
+        if db_file and fb_file:
+            try:
+                _db_mod = _import_from_file("_bridge_db", db_file)
+                _fb_mod = _import_from_file("_bridge_fb_google", fb_file)
+                save_lead = getattr(_db_mod, "save_lead")
+                send_event_to_all = getattr(_fb_mod, "send_event_to_all")
+                IMPORT_INFO.update({
+                    "strategy": "file",
+                    "chosen_dir": chosen,
+                    "db_file": db_file,
+                    "fb_file": fb_file,
+                })
+            except Exception as e3:
+                IMPORT_INFO["errors"].append(f"file import: {e3}")
+        else:
+            IMPORT_INFO["errors"].append(f"arquivos não encontrados em {chosen} (db.py/db/__init__.py e/ou fb_google.py/fb_google/__init__.py)")
+    else:
+        IMPORT_INFO["errors"].append("nenhuma pasta candidata existente")
 
-# 3) se ainda falhou, loga e aborta
-if "save_lead" not in globals() or "send_event_to_all" not in globals():
+# Falha final?
+if save_lead is None or send_event_to_all is None:
     logger.error(json.dumps({
-        **IMPORT_DEBUG,
-        "ls_app": _ls("/app"),
-        "ls_root": _ls("/"),
+        "event": "IMPORT_STATUS",
+        **IMPORT_INFO,
+        "ls_base": _ls(BASE_DIR),
+        "ls_parent": _ls(PARENT_DIR),
+        "ls_chosen": _ls(IMPORT_INFO.get("chosen_dir")),
     }))
-    raise RuntimeError(
-        "❌ Não foi possível localizar 'db.py' e 'fb_google.py'. "
-        "Garanta que a pasta 'bot_gesto' esteja ao lado do app_bridge.py (mesma pasta) "
-        "e que o .dockerignore NÃO a exclui. Alternativamente, defina BRIDGE_BOT_DIR com o caminho da pasta."
-    )
+    raise RuntimeError("❌ Não foi possível localizar 'save_lead' e 'send_event_to_all'. "
+                       "Garanta que a pasta 'bot_gesto' foi copiada para o container ao lado do app_bridge.py "
+                       "ou defina BRIDGE_BOT_DIR com o caminho correto.")
 
-logger.info(json.dumps({**IMPORT_DEBUG, "event": "IMPORT_OK"}))
+logger.info(json.dumps({
+    "event": "IMPORT_OK",
+    **{k: v for k, v in IMPORT_INFO.items() if k != "errors"},
+}))
 
 # =============================
 # ENV do Bridge
@@ -157,13 +189,12 @@ BRIDGE_API_KEY = os.getenv("BRIDGE_API_KEY", "")
 ALLOWED_ORIGINS = (os.getenv("ALLOWED_ORIGINS", "") or "").split(",")
 PORT = int(os.getenv("PORT", "8080"))
 
-# Criptografia opcional
 CRYPTO_KEY = os.getenv("CRYPTO_KEY")
 fernet = None
 if CRYPTO_KEY:
     derived = base64.urlsafe_b64encode(hashlib.sha256(CRYPTO_KEY.encode()).digest())
     fernet = Fernet(derived)
-    logger.info("✅ Crypto: Fernet habilitado no Bridge")
+    logger.info("✅ Crypto: Fernet habilitado")
 
 if not BOT_USERNAME:
     raise RuntimeError("BOT_USERNAME não configurado (ex.: SeuBotUsername)")
@@ -195,6 +226,7 @@ class TBPayload(BaseModel):
     gbraid: Optional[str] = None
     wbraid: Optional[str] = None
     cid: Optional[str] = None
+
     landing_url: Optional[str] = None
     event_source_url: Optional[str] = None
     utm_source: Optional[str] = None
@@ -202,9 +234,11 @@ class TBPayload(BaseModel):
     utm_campaign: Optional[str] = None
     utm_term: Optional[str] = None
     utm_content: Optional[str] = None
+
     device: Optional[str] = None
     os: Optional[str] = None
     user_agent: Optional[str] = Field(default=None, alias="user_agent")
+
     email: Optional[str] = None
     phone: Optional[str] = None
     first_name: Optional[str] = None
@@ -213,8 +247,10 @@ class TBPayload(BaseModel):
     state: Optional[str] = None
     zip: Optional[str] = None
     country: Optional[str] = None
+
     value: Optional[float] = None
     currency: Optional[str] = None
+
     extra: Optional[Dict[str, Any]] = None
 
     class Config:
@@ -274,12 +310,12 @@ def health():
         status = {"status": "degraded", "redis_error": str(e)}
 
     status.update({
-        "import_strategy": IMPORT_DEBUG.get("strategy"),
-        "bot_dir": IMPORT_DEBUG.get("chosen_dir"),
-        "db_present": IMPORT_DEBUG.get("db_exists"),
-        "fb_present": IMPORT_DEBUG.get("fb_exists"),
-        "ls_base": IMPORT_DEBUG.get("ls_base"),
-        "notes": IMPORT_DEBUG.get("errors"),
+        "import_strategy": IMPORT_INFO.get("strategy"),
+        "bot_dir": IMPORT_INFO.get("chosen_dir"),
+        "db_file": IMPORT_INFO.get("db_file"),
+        "fb_file": IMPORT_INFO.get("fb_file"),
+        "errors": IMPORT_INFO.get("errors"),
+        "ls_bot_dir": _ls(IMPORT_INFO.get("chosen_dir")),
     })
     return status
 
@@ -290,10 +326,8 @@ async def create_deeplink(
     x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
 ):
     _auth_guard(x_api_key)
-
     client_ip = req.client.host if req.client else None
     client_ua = req.headers.get("user-agent")
-
     data = body.dict(by_alias=True, exclude_none=True)
     enriched = _enrich_payload(data, client_ip, client_ua)
 
@@ -307,7 +341,6 @@ async def create_deeplink(
         "expires_in": TOKEN_TTL_SEC,
         "payload_keys": list(enriched.keys())
     }))
-
     return {"deep_link": deep_link, "token": token, "expires_in": TOKEN_TTL_SEC}
 
 @app.post("/webhook")
@@ -317,21 +350,18 @@ async def webhook(
     x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
 ):
     _auth_guard(x_api_key)
-
     client_ip = req.client.host if req.client else None
     client_ua = req.headers.get("user-agent")
-
     data = body.dict(by_alias=True, exclude_none=True)
     enriched = _enrich_payload(data, client_ip, client_ua)
 
-    asyncio.create_task(save_lead(enriched))
-    asyncio.create_task(send_event_to_all(enriched, et="Lead"))
+    asyncio.create_task(save_lead(enriched))              # DB
+    asyncio.create_task(send_event_to_all(enriched, et="Lead"))  # Pixels
 
     logger.info(json.dumps({
         "event": "WEBHOOK_RECEIVED",
         "payload_keys": list(enriched.keys())
     }))
-
     return {"status": "ok", "saved": True, "events": ["Lead"]}
 
 @app.get("/tb/peek/{token}")

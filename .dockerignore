@@ -1,10 +1,10 @@
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 *.log
+.env
 .git
 .gitignore
-.env
-.venv
-venv/
-node_modules/
+.vscode/
+.idea/
