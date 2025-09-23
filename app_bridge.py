@@ -1,8 +1,8 @@
 # =============================
-# app_bridge.py — versão 2.4 estável (sincronizado com bot_gesto direto)
+# app_bridge.py — versão 2.6 estável (auto-sync com bot_gesto)
 # =============================
-import os, sys, json, time, secrets, logging, asyncio, base64, hashlib
-from typing import Optional, Dict, Any
+import os, sys, json, time, secrets, logging, asyncio, base64, hashlib, importlib.util
+from typing import Optional, Dict, Any, Tuple
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -31,21 +31,121 @@ _ch.setFormatter(JSONFormatter())
 logger.addHandler(_ch)
 
 # =============================
-# Import dos módulos do Bot B (pasta local bot_gesto)
+# Descoberta e import dinâmico do Bot B
 # =============================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-BOT_B_PATH = os.path.join(BASE_DIR, "bot_gesto")
-if BOT_B_PATH not in sys.path:
-    sys.path.append(BOT_B_PATH)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))    # /app (no container)
+PARENT_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
+CWD_DIR = os.getcwd()
+
+def _exists(p: Optional[str]) -> bool:
+    try:
+        return bool(p) and os.path.isdir(p)
+    except Exception:
+        return False
+
+def _files_ok(d: str) -> bool:
+    return os.path.isfile(os.path.join(d, "db.py")) and os.path.isfile(os.path.join(d, "fb_google.py"))
+
+def _import_module_from_file(modname: str, filepath: str):
+    spec = importlib.util.spec_from_file_location(modname, filepath)
+    if not spec or not spec.loader:
+        raise ImportError(f"spec loader inválido para {filepath}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[attr-defined]
+    return module
+
+IMPORT_DEBUG: Dict[str, Any] = {
+    "strategy": None,
+    "base_dir": BASE_DIR,
+    "parent_dir": PARENT_DIR,
+    "cwd": CWD_DIR,
+    "candidates": [],
+    "chosen_dir": None,
+    "db_exists": None,
+    "fb_exists": None,
+    "errors": [],
+}
+
+# 1) Tenta como pacote: from bot_gesto... (correto quando /app está no sys.path e bot_gesto é pacote)
+if BASE_DIR not in sys.path:
+    sys.path.append(BASE_DIR)
 
 try:
-    from bot_gesto.db import save_lead
-    from bot_gesto.fb_google import send_event_to_all
-except ImportError as e:
-    raise RuntimeError(
-        f"❌ Falha ao importar módulos do Bot B (bot_gesto). "
-        f"Verifique se db.py e fb_google.py existem em {BOT_B_PATH}. Erro: {e}"
-    )
+    from bot_gesto.db import save_lead  # type: ignore
+    from bot_gesto.fb_google import send_event_to_all  # type: ignore
+    IMPORT_DEBUG.update({
+        "strategy": "package_import_bot_gesto",
+        "chosen_dir": os.path.join(BASE_DIR, "bot_gesto"),
+        "db_exists": os.path.isfile(os.path.join(BASE_DIR, "bot_gesto", "db.py")),
+        "fb_exists": os.path.isfile(os.path.join(BASE_DIR, "bot_gesto", "fb_google.py")),
+    })
+except Exception as e_pkg1:
+    IMPORT_DEBUG["errors"].append(f"package bot_gesto: {e_pkg1}")
+
+    # 2) Tenta como pacote: from typebot_conection.bot_gesto...
+    try:
+        from typebot_conection.bot_gesto.db import save_lead  # type: ignore
+        from typebot_conection.bot_gesto.fb_google import send_event_to_all  # type: ignore
+        IMPORT_DEBUG.update({
+            "strategy": "package_import_typebot_conection.bot_gesto",
+            "chosen_dir": os.path.join(BASE_DIR, "typebot_conection", "bot_gesto"),
+            "db_exists": os.path.isfile(os.path.join(BASE_DIR, "typebot_conection", "bot_gesto", "db.py")),
+            "fb_exists": os.path.isfile(os.path.join(BASE_DIR, "typebot_conection", "bot_gesto", "fb_google.py")),
+        })
+    except Exception as e_pkg2:
+        IMPORT_DEBUG["errors"].append(f"package typebot_conection.bot_gesto: {e_pkg2}")
+
+        # 3) Fallback: importar por caminho absoluto (aceita qualquer layout)
+        candidates = [
+            os.path.join(BASE_DIR, "bot_gesto"),
+            os.path.join(BASE_DIR, "typebot_conection", "bot_gesto"),
+            os.path.join(PARENT_DIR, "bot_gesto"),
+            os.path.join(PARENT_DIR, "typebot_conection", "bot_gesto"),
+            os.path.join(CWD_DIR, "bot_gesto"),
+            os.path.join(CWD_DIR, "typebot_conection", "bot_gesto"),
+        ]
+        IMPORT_DEBUG["candidates"] = candidates
+
+        chosen_dir: Optional[str] = None
+        for d in candidates:
+            if _exists(d) and _files_ok(d):
+                chosen_dir = d
+                break
+
+        if not chosen_dir:
+            logger.error(json.dumps({
+                "event": "IMPORT_FAIL",
+                **IMPORT_DEBUG,
+            }))
+            raise RuntimeError(
+                "❌ Não foi possível localizar a pasta com db.py e fb_google.py "
+                "(tente garantir que 'bot_gesto' fique ao lado do app_bridge.py, "
+                "ou dentro de 'typebot_conection/bot_gesto')."
+            )
+
+        try:
+            db_mod = _import_module_from_file("_bridge_db", os.path.join(chosen_dir, "db.py"))
+            fb_mod = _import_module_from_file("_bridge_fb_google", os.path.join(chosen_dir, "fb_google.py"))
+            save_lead = getattr(db_mod, "save_lead")
+            send_event_to_all = getattr(fb_mod, "send_event_to_all")
+            IMPORT_DEBUG.update({
+                "strategy": "file_import",
+                "chosen_dir": chosen_dir,
+                "db_exists": True,
+                "fb_exists": True,
+            })
+        except Exception as e_file:
+            IMPORT_DEBUG["errors"].append(f"file_import: {e_file}")
+            logger.error(json.dumps({
+                "event": "IMPORT_FAIL",
+                **IMPORT_DEBUG,
+            }))
+            raise
+
+logger.info(json.dumps({
+    "event": "IMPORT_OK",
+    **{k: v for k, v in IMPORT_DEBUG.items() if k != "errors"},
+}))
 
 # =============================
 # ENV do Bridge
@@ -73,7 +173,7 @@ redis = Redis.from_url(REDIS_URL, decode_responses=True)
 # =============================
 # App & CORS
 # =============================
-app = FastAPI(title="Typebot Bridge", version="2.4.0")
+app = FastAPI(title="Typebot Bridge", version="2.6.0")
 
 if ALLOWED_ORIGINS and ALLOWED_ORIGINS != ['']:
     app.add_middleware(
@@ -147,10 +247,12 @@ def _auth_guard(x_api_key: Optional[str]):
     if BRIDGE_API_KEY and (not x_api_key or x_api_key != BRIDGE_API_KEY):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-def _enrich_payload(data: dict, client_ip: str, client_ua: str) -> dict:
+def _enrich_payload(data: dict, client_ip: Optional[str], client_ua: Optional[str]) -> dict:
     """Aplica enriquecimento e normalização no payload recebido"""
-    data.setdefault("ip", client_ip)
-    data.setdefault("user_agent", data.get("user_agent") or client_ua)
+    if client_ip:
+        data.setdefault("ip", client_ip)
+    if client_ua:
+        data.setdefault("user_agent", data.get("user_agent") or client_ua)
     data.setdefault("ts", int(time.time()))
 
     # cookies FB
@@ -187,9 +289,11 @@ def health():
         status = {"status": "degraded", "redis_error": str(e)}
 
     status.update({
-        "bot_dir": BOT_B_PATH,
-        "db_present": os.path.isfile(os.path.join(BOT_B_PATH, "db.py")),
-        "fb_present": os.path.isfile(os.path.join(BOT_B_PATH, "fb_google.py")),
+        "import_strategy": IMPORT_DEBUG.get("strategy"),
+        "bot_dir": IMPORT_DEBUG.get("chosen_dir"),
+        "db_present": IMPORT_DEBUG.get("db_exists"),
+        "fb_present": IMPORT_DEBUG.get("fb_exists"),
+        "errors": IMPORT_DEBUG.get("errors"),
     })
     return status
 
@@ -197,7 +301,7 @@ def health():
 async def create_deeplink(
     req: Request,
     body: TBPayload,
-    x_api_key: Optional[str] = Header(default=None, convert_underscores=False)
+    x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
 ):
     _auth_guard(x_api_key)
 
@@ -224,7 +328,7 @@ async def create_deeplink(
 async def webhook(
     req: Request,
     body: TBPayload,
-    x_api_key: Optional[str] = Header(default=None, convert_underscores=False)
+    x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
 ):
     """
     Integração direta: Typebot → Bridge → DB + Pixels (FB/GA4)
