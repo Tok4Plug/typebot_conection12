@@ -1,0 +1,39 @@
+# =============================
+# Framework Web
+# =============================
+fastapi==0.111.0          # Framework principal da API
+uvicorn[standard]==0.30.6 # Servidor ASGI otimizado (com uvloop e httptools)
+
+# =============================
+# Redis / Cache / Fila
+# =============================
+redis==5.1.1              # Cliente Redis moderno e performático
+
+# =============================
+# Validação / Config
+# =============================
+pydantic==2.7.4           # Validação de dados robusta
+python-dotenv==1.0.1      # Carregar variáveis de ambiente (.env)
+
+# =============================
+# HTTP Requests / Async
+# =============================
+aiohttp==3.9.5            # HTTP client assíncrono
+httpx==0.27.0             # Alternativa moderna para requests assíncronas
+
+# =============================
+# Segurança / Criptografia
+# =============================
+cryptography==43.0.1      # Criptografia robusta (enriquecimento, hashing)
+python-jose==3.3.0        # JWT e assinaturas seguras
+
+# =============================
+# Observabilidade / Métricas
+# =============================
+prometheus-client==0.20.0 # Exposição de métricas /health e /metrics
+structlog==24.4.0         # Logging estruturado para alta escala
+
+# =============================
+# Extras / Typing
+# =============================
+typing-extensions==4.12.2 # Suporte de tipagem moderna (necessário p/ pydantic v2+)
