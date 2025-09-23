@@ -1,4 +1,6 @@
-# app_bridge.py — versão 2.3 estável (sincronizado com bot_gesto)
+# =============================
+# app_bridge.py — versão 2.4 estável (sincronizado com typebot_conection.bot_gesto)
+# =============================
 import os, sys, json, time, secrets, logging, asyncio, base64, hashlib
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, Request, Header, HTTPException
@@ -8,7 +10,7 @@ from redis import Redis
 from cryptography.fernet import Fernet
 
 # =============================
-# Logging JSON
+# Logging JSON estruturado
 # =============================
 class JSONFormatter(logging.Formatter):
     def format(self, record):
@@ -29,20 +31,20 @@ _ch.setFormatter(JSONFormatter())
 logger.addHandler(_ch)
 
 # =============================
-# Import direto do Bot B (bot_gesto)
+# Import dos módulos do Bot B (dentro de typebot_conection.bot_gesto)
 # =============================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-BOT_B_PATH = os.path.join(BASE_DIR, "bot_gesto")
-if BOT_B_PATH not in sys.path:
-    sys.path.append(BOT_B_PATH)
+ROOT_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
 
 try:
-    from bot_gesto.db import save_lead
-    from bot_gesto.fb_google import send_event_to_all
+    from typebot_conection.bot_gesto.db import save_lead
+    from typebot_conection.bot_gesto.fb_google import send_event_to_all
 except ImportError as e:
     raise RuntimeError(
-        f"❌ Falha ao importar módulos do Bot B em {BOT_B_PATH}. "
-        f"Verifique se db.py e fb_google.py existem lá. Erro: {e}"
+        f"❌ Falha ao importar módulos do Bot B (typebot_conection.bot_gesto). "
+        f"Verifique se db.py e fb_google.py existem em typebot_conection/bot_gesto. Erro: {e}"
     )
 
 # =============================
@@ -71,7 +73,7 @@ redis = Redis.from_url(REDIS_URL, decode_responses=True)
 # =============================
 # App & CORS
 # =============================
-app = FastAPI(title="Typebot Bridge", version="2.3.0")
+app = FastAPI(title="Typebot Bridge", version="2.4.0")
 
 if ALLOWED_ORIGINS and ALLOWED_ORIGINS != ['']:
     app.add_middleware(
@@ -146,7 +148,7 @@ def _auth_guard(x_api_key: Optional[str]):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 def _enrich_payload(data: dict, client_ip: str, client_ua: str) -> dict:
-    """Aplica enriquecimento total no payload recebido"""
+    """Aplica enriquecimento e normalização no payload recebido"""
     data.setdefault("ip", client_ip)
     data.setdefault("user_agent", data.get("user_agent") or client_ua)
     data.setdefault("ts", int(time.time()))
@@ -162,7 +164,7 @@ def _enrich_payload(data: dict, client_ip: str, client_ua: str) -> dict:
     if not data.get("cid") and data.get("gclid"):
         data["cid"] = f"gclid.{data['gclid']}"
 
-    # Criptografia opcional do payload
+    # Criptografia opcional
     if fernet:
         try:
             raw = json.dumps(data).encode()
@@ -185,9 +187,9 @@ def health():
         status = {"status": "degraded", "redis_error": str(e)}
 
     status.update({
-        "bot_dir": BOT_B_PATH,
-        "db_present": os.path.isfile(os.path.join(BOT_B_PATH, "db.py")),
-        "fb_present": os.path.isfile(os.path.join(BOT_B_PATH, "fb_google.py")),
+        "bot_dir": os.path.join("typebot_conection", "bot_gesto"),
+        "db_present": os.path.isfile(os.path.join(BASE_DIR, "bot_gesto", "db.py")),
+        "fb_present": os.path.isfile(os.path.join(BASE_DIR, "bot_gesto", "fb_google.py")),
     })
     return status
 
