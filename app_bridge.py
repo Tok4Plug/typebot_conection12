@@ -1,5 +1,5 @@
 # =============================
-# app_bridge.py — versão 2.4 estável (sincronizado com typebot_conection.bot_gesto)
+# app_bridge.py — versão 2.4 estável (sincronizado com bot_gesto direto)
 # =============================
 import os, sys, json, time, secrets, logging, asyncio, base64, hashlib
 from typing import Optional, Dict, Any
@@ -31,20 +31,20 @@ _ch.setFormatter(JSONFormatter())
 logger.addHandler(_ch)
 
 # =============================
-# Import dos módulos do Bot B (dentro de typebot_conection.bot_gesto)
+# Import dos módulos do Bot B (pasta local bot_gesto)
 # =============================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
-if ROOT_DIR not in sys.path:
-    sys.path.append(ROOT_DIR)
+BOT_B_PATH = os.path.join(BASE_DIR, "bot_gesto")
+if BOT_B_PATH not in sys.path:
+    sys.path.append(BOT_B_PATH)
 
 try:
-    from typebot_conection.bot_gesto.db import save_lead
-    from typebot_conection.bot_gesto.fb_google import send_event_to_all
+    from bot_gesto.db import save_lead
+    from bot_gesto.fb_google import send_event_to_all
 except ImportError as e:
     raise RuntimeError(
-        f"❌ Falha ao importar módulos do Bot B (typebot_conection.bot_gesto). "
-        f"Verifique se db.py e fb_google.py existem em typebot_conection/bot_gesto. Erro: {e}"
+        f"❌ Falha ao importar módulos do Bot B (bot_gesto). "
+        f"Verifique se db.py e fb_google.py existem em {BOT_B_PATH}. Erro: {e}"
     )
 
 # =============================
@@ -187,9 +187,9 @@ def health():
         status = {"status": "degraded", "redis_error": str(e)}
 
     status.update({
-        "bot_dir": os.path.join("typebot_conection", "bot_gesto"),
-        "db_present": os.path.isfile(os.path.join(BASE_DIR, "bot_gesto", "db.py")),
-        "fb_present": os.path.isfile(os.path.join(BASE_DIR, "bot_gesto", "fb_google.py")),
+        "bot_dir": BOT_B_PATH,
+        "db_present": os.path.isfile(os.path.join(BOT_B_PATH, "db.py")),
+        "fb_present": os.path.isfile(os.path.join(BOT_B_PATH, "fb_google.py")),
     })
     return status
 
