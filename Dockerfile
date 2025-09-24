@@ -1,27 +1,31 @@
 # =============================
-# Dockerfile — Bridge + bot_gesto
+# Dockerfile — Bridge + BotGestor com supervisord
 # =============================
 FROM python:3.11-slim
 
-WORKDIR /app
-
-# deps do bridge
-COPY requirements-bridge.txt ./requirements-bridge.txt
-RUN pip install --no-cache-dir -r requirements-bridge.txt
-
-# deps do bot_gesto
-COPY bot_gesto/requirements.txt ./bot_gesto/requirements.txt
-RUN pip install --no-cache-dir -r bot_gesto/requirements.txt
-
-# código
-COPY . .
-
-# dica: se quiser fixar a raiz do bot, descomente a linha abaixo
-# ENV BRIDGE_BOT_DIR=/app/bot_gesto
-
+# Variáveis globais
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PORT=8080
 
+WORKDIR /app
+
+# 1) Deps do Bridge
+COPY requirements-bridge.txt ./requirements-bridge.txt
+RUN pip install --no-cache-dir -r requirements-bridge.txt
+
+# 2) Deps do bot_gesto
+COPY bot_gesto/requirements.txt ./requirements-bot.txt
+RUN pip install --no-cache-dir -r requirements-bot.txt
+
+# 3) Instala supervisord
+RUN pip install --no-cache-dir supervisor
+
+# 4) Copia todo o código (Bridge + BotGestor)
+COPY . .
+
+# 5) Expõe porta para o Bridge
 EXPOSE 8080
-CMD ["uvicorn", "app_bridge:app", "--host", "0.0.0.0", "--port", "8080"]
+
+# 6) Usa supervisord para orquestrar bridge + bot + worker
+CMD ["supervisord", "-c", "/app/supervisord.conf"]
