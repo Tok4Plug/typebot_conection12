@@ -1,16 +1,17 @@
 # retrofeed.py
 import os, json, asyncio, logging
 from redis import Redis
-from db import init_db, get_unsent_leads
+from bot_gesto.db import init_db, get_unsent_leads
 
-# ==============================
-# Config
-# ==============================
+# =============================
+# Configurações
+# =============================
 REDIS_URL = os.getenv("REDIS_URL")
 STREAM = os.getenv("REDIS_STREAM", "buyers_stream")
 
 redis = Redis.from_url(REDIS_URL, decode_responses=True)
 
+# Logger padronizado para supervisord (sem Illegal seek)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"

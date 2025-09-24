@@ -1,4 +1,4 @@
-# bot.py — versão 2.4 com Invite Link em mensagem separada (Preview otimizado)
+# bot.py — versão 2.4 com Invite Link em mensagem separada
 import os, logging, json, asyncio, time
 from datetime import datetime
 from typing import Dict, Any, Optional
@@ -8,10 +8,12 @@ import redis
 from cryptography.fernet import Fernet
 from prometheus_client import Counter, Histogram
 
+# =============================
 # DB / Pixels
-from db import save_lead, init_db, sync_pending_leads
-from fb_google import enqueue_event, process_event_queue, send_event_to_all
-from utils import now_ts
+# =============================
+from bot_gesto.db import save_lead, init_db, sync_pending_leads
+from bot_gesto.fb_google import enqueue_event, process_event_queue, send_event_to_all
+from bot_gesto.utils import now_ts
 
 # =============================
 # Logging estruturado (JSON)

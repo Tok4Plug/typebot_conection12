@@ -1,18 +1,22 @@
 # worker.py
-import os, asyncio, json, signal
+import os, asyncio, json, signal, logging
 from redis import Redis
-from fb_google import send_event
-from utils import derive_event_from_route, should_send_event
+from bot_gesto.fb_google import send_event
+from bot_gesto.utils import derive_event_from_route, should_send_event
 
-# =========================
+# =============================
 # Configurações
-# =========================
+# =============================
 REDIS_URL = os.getenv("REDIS_URL")
 STREAM = os.getenv("REDIS_STREAM", "buyers_stream")
 GROUP = os.getenv("REDIS_GROUP", "botb_group")
 CONSUMER = os.getenv("REDIS_CONSUMER", "worker-1")
 
 redis = Redis.from_url(REDIS_URL, decode_responses=True)
+
+# Logger básico (para aparecer no supervisord sem Illegal seek)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("worker")
 
 running = True
 
