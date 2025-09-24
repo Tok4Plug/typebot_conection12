@@ -1,59 +1,45 @@
 # =============================
-# Dockerfile — Bridge + BotGestor com supervisord (corrigido 100%)
+# Framework Web
 # =============================
-FROM python:3.11-alpine
+fastapi==0.111.0
+uvicorn[standard]==0.30.6
 
-# -----------------------------
-# 1) Variáveis globais
-# -----------------------------
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PORT=8080 \
-    PATH="/usr/local/bin:$PATH"
+# =============================
+# Redis / Cache / Fila
+# =============================
+redis==5.1.1
 
-WORKDIR /app
+# =============================
+# Validação / Config
+# =============================
+pydantic==2.7.4
+python-dotenv==1.0.1
 
-# -----------------------------
-# 2) Instala pacotes básicos do sistema
-# -----------------------------
-# Incluímos build-base (gcc, g++, make) + libpq para PostgreSQL
-RUN apk add --no-cache \
-    build-base \
-    libpq-dev \
-    musl-dev \
-    linux-headers \
-    bash \
-    curl
+# =============================
+# HTTP Requests / Async
+# =============================
+aiohttp==3.9.5
+httpx==0.27.0
 
-# -----------------------------
-# 3) Deps do Bridge
-# -----------------------------
-COPY requirements-bridge.txt ./requirements-bridge.txt
-RUN pip install --no-cache-dir -r requirements-bridge.txt
+# =============================
+# Segurança / Criptografia
+# =============================
+cryptography==43.0.1
+python-jose==3.3.0
 
-# -----------------------------
-# 4) Deps do BotGestor
-# -----------------------------
-COPY bot_gesto/requirements.txt ./requirements-bot.txt
-RUN pip install --no-cache-dir -r requirements-bot.txt
+# =============================
+# Observabilidade / Métricas
+# =============================
+prometheus-client==0.20.0
+structlog==24.4.0
 
-# -----------------------------
-# 5) Instala supervisord
-# -----------------------------
-RUN pip install --no-cache-dir supervisor
+# =============================
+# GeoIP / Enriquecimento
+# =============================
+geoip2==4.8.0         # Leitura do banco MaxMind GeoLite2
+maxminddb==2.6.2      # Driver nativo do mmdb para alta performance
 
-# -----------------------------
-# 6) Copia todo o código (Bridge + BotGestor + configs)
-# -----------------------------
-COPY . .
-
-# -----------------------------
-# 7) Expõe portas necessárias
-# -----------------------------
-EXPOSE 8080
-EXPOSE 8000
-
-# -----------------------------
-# 8) Supervisord como entrypoint
-# -----------------------------
-CMD ["supervisord", "-c", "/app/supervisord.conf"]
+# =============================
+# Extras / Typing
+# =============================
+typing-extensions==4.12.2

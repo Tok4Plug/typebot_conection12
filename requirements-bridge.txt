@@ -36,13 +36,26 @@ structlog==24.4.0          # Logging estruturado (JSON logs para alta escala)
 # =============================
 # Enriquecimento Avançado
 # =============================
-geoip2==4.8.0              # Lookup GeoIP (cidade, país, lat/lon)
-user-agents==2.2.0         # Parse de user-agent (browser, OS, device)
+geoip2==4.8.0              # Lookup GeoIP (cidade, país, ASN, lat/lon)
+maxminddb==2.6.2           # Driver nativo do mmdb (performance no GeoIP2)
+user-agents==2.2.0         # Parse avançado de user-agent (browser, OS, device)
 
 # =============================
 # Supervisor / Orquestração
 # =============================
 supervisor==4.2.5          # Gerenciador de processos (bot, worker, bridge, admin)
+
+# =============================
+# Banco de Dados (BotGestor)
+# =============================
+SQLAlchemy==2.0.32         # ORM moderno e performático
+alembic==1.13.2            # Migrações automáticas do banco
+psycopg2-binary==2.9.9     # Driver PostgreSQL (binário, produção)
+
+# =============================
+# Telegram Bot (BotGestor)
+# =============================
+aiogram==2.25.2            # Framework para Telegram Bot (estável)
 
 # =============================
 # Extras / Typing
