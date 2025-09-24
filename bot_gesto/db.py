@@ -2,7 +2,10 @@
 import os, asyncio, json, time, hashlib, base64, logging
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
-import utils
+
+import sys
+sys.path.append(os.path.dirname(__file__))
+import utils  # agora funciona SEM erro
 
 from sqlalchemy import (
     create_engine, Column, Integer, String, Boolean,

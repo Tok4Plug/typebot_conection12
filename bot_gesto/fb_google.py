@@ -1,14 +1,21 @@
-# fb_google.py — versão 2.0 avançada (sincronizado com bot/bridge/utils)
+# fb_google.py — versão 2.0 avançada (sincronizado com bot/bridge)
 import os, aiohttp, asyncio, json, logging
 from typing import Dict, Any
-import utils build_fb_payload, build_ga4_payload
 
-# =========================
+# Ajuste de path para permitir import de utils
+import sys
+sys.path.append(os.path.dirname(__file__))
+import utils  # agora funciona em qualquer contexto
+
+# Importa helpers do utils
+from utils import build_fb_payload, build_ga4_payload
+
+# ============================
 # Configurações de ENV
-# =========================
+# ============================
 FB_API_VERSION = os.getenv("FB_API_VERSION", "v20.0")
-FB_PIXEL_ID = os.getenv("FB_PIXEL_ID")
-FB_ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN")
+FB_PIXEL_ID = os.getenv("FB_PIXEL_ID", "")
+FB_ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN", "")
 
 GA4_MEASUREMENT_ID = os.getenv("GA4_MEASUREMENT_ID", "")
 GA4_API_SECRET = os.getenv("GA4_API_SECRET", "")
