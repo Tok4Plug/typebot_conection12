@@ -1,7 +1,7 @@
 # =============================
-# Dockerfile — Bridge + BotGestor com supervisord (corrigido)
+# Dockerfile — Bridge + BotGestor com supervisord (corrigido 100%)
 # =============================
-FROM python:3.11.9-slim-bullseye
+FROM python:3.11-alpine
 
 # -----------------------------
 # 1) Variáveis globais
@@ -16,12 +16,14 @@ WORKDIR /app
 # -----------------------------
 # 2) Instala pacotes básicos do sistema
 # -----------------------------
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    g++ \
-    make \
+# Incluímos build-base (gcc, g++, make) + libpq para PostgreSQL
+RUN apk add --no-cache \
+    build-base \
     libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
+    musl-dev \
+    linux-headers \
+    bash \
+    curl
 
 # -----------------------------
 # 3) Deps do Bridge
