@@ -1,0 +1,10 @@
+# ignora cache e lixo
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# mas NÃO ignore os arquivos do bot
+!db.py
+!fb_google.py
+!__init__.py

@@ -1,0 +1,56 @@
+# =============================
+# Bot Telegram & Async
+# =============================
+aiogram==2.25.1
+aiohttp==3.8.6          # última versão compatível com aiogram 2.25.1
+multidict==6.0.4
+yarl==1.9.2
+async-timeout==4.0.3    # corrigida para última release compatível
+
+# =============================
+# Banco de dados (sync + async)
+# =============================
+SQLAlchemy[asyncio]==2.0.31   # última release estável (com asyncio nativo)
+psycopg2-binary==2.9.9        # suporte sync (usado em db.py e testes locais)
+asyncpg==0.29.0               # driver async obrigatório
+alembic==1.13.1               # migrations atualizado e compatível com SQLAlchemy 2.x
+
+# =============================
+# Cache / Filas / Redis
+# =============================
+redis==5.1.1   # última versão estável (corrige bugs importantes)
+
+# =============================
+# HTTP / Requests / APIs
+# =============================
+requests==2.32.3     # última versão
+python-dotenv==1.0.1
+httpx==0.27.0        # suporte total para requests assíncronas
+
+# =============================
+# Web server / Worker
+# =============================
+gunicorn==23.0.0
+uvicorn[standard]==0.30.6     # corrigido para última versão estável
+fastapi==0.111.0              # última versão estável (sem breaking changes)
+
+# =============================
+# Segurança / Criptografia
+# =============================
+cryptography==43.0.1   # versão estável e mais segura
+python-jose==3.3.0
+
+# =============================
+# Observabilidade / Métricas
+# =============================
+prometheus-client==0.20.0   # última release estável
+
+# =============================
+# Logs / Debug
+# =============================
+structlog==24.4.0   # versão 2024, mais atual
+
+# =============================
+# Extras / Typing
+# =============================
+typing-extensions==4.12.2   # atualizado
