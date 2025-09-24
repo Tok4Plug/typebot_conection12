@@ -1,7 +1,7 @@
 # =============================
-# Dockerfile — Bridge + BotGestor com supervisord + GeoIP
+# Dockerfile — Bridge + BotGestor com supervisord + GeoIP (sem Docker Hub)
 # =============================
-FROM python:3.11-slim
+FROM ghcr.io/library/python:3.11-slim
 
 # -----------------------------
 # 1) Variáveis globais
@@ -27,23 +27,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # -----------------------------
-# 3) Copia requirements
+# 3) Instala dependências do Bridge
 # -----------------------------
-COPY requirements.txt ./requirements.txt
+COPY requirements-bridge.txt ./requirements-bridge.txt
+RUN pip install --no-cache-dir -r requirements-bridge.txt
 
 # -----------------------------
-# 4) Instala dependências Python
+# 4) Instala dependências do BotGestor
 # -----------------------------
-RUN pip install --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir -r requirements.txt
+COPY bot_gesto/requirements.txt ./requirements-bot.txt
+RUN pip install --no-cache-dir -r requirements-bot.txt
 
 # -----------------------------
-# 5) Copia todo o código (Bridge + BotGestor + configs)
+# 5) Instala supervisord
+# -----------------------------
+RUN pip install --no-cache-dir supervisor
+
+# -----------------------------
+# 6) Copia todo o código (Bridge + BotGestor + configs)
 # -----------------------------
 COPY . .
 
 # -----------------------------
-# 6) Baixa banco GeoLite2 (GeoIP2)
+# 7) Baixa banco GeoLite2 (GeoIP2)
 # -----------------------------
 RUN curl -L -o GeoLite2-City.mmdb.tar.gz \
     https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-City.mmdb.tar.gz \
@@ -51,12 +57,12 @@ RUN curl -L -o GeoLite2-City.mmdb.tar.gz \
     && rm GeoLite2-City.mmdb.tar.gz
 
 # -----------------------------
-# 7) Expõe portas necessárias
+# 8) Expõe portas necessárias
 # -----------------------------
 EXPOSE 8080   # Bridge
 EXPOSE 8000   # Admin
 
 # -----------------------------
-# 8) Supervisord como entrypoint
+# 9) Supervisord como entrypoint
 # -----------------------------
 CMD ["supervisord", "-c", "/app/supervisord.conf"]
