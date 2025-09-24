@@ -48,8 +48,8 @@ COPY . .
 # -----------------------------
 # 7) Expõe portas necessárias
 # -----------------------------
-EXPOSE 8080   # Bridge
-EXPOSE 8000   # Admin Service (se usar Prometheus)
+EXPOSE 8080
+EXPOSE 8000
 
 # -----------------------------
 # 8) Supervisord como entrypoint
