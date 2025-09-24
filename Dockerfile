@@ -59,8 +59,10 @@ RUN curl -L -o GeoLite2-City.mmdb.tar.gz \
 # -----------------------------
 # 8) Expõe portas necessárias
 # -----------------------------
-EXPOSE 8080   # Bridge
-EXPOSE 8000   # Admin
+# Bridge
+EXPOSE 8080
+# Admin
+EXPOSE 8000
 
 # -----------------------------
 # 9) Supervisord como entrypoint
