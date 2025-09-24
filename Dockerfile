@@ -1,45 +1,62 @@
 # =============================
-# Framework Web
+# Dockerfile — Bridge + BotGestor com supervisord + GeoIP
 # =============================
-fastapi==0.111.0
-uvicorn[standard]==0.30.6
+FROM python:3.11-slim
 
-# =============================
-# Redis / Cache / Fila
-# =============================
-redis==5.1.1
+# -----------------------------
+# 1) Variáveis globais
+# -----------------------------
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PORT=8080 \
+    PATH="/usr/local/bin:$PATH" \
+    GEOIP_PATH="/app/GeoLite2-City.mmdb"
 
-# =============================
-# Validação / Config
-# =============================
-pydantic==2.7.4
-python-dotenv==1.0.1
+WORKDIR /app
 
-# =============================
-# HTTP Requests / Async
-# =============================
-aiohttp==3.9.5
-httpx==0.27.0
+# -----------------------------
+# 2) Instala pacotes básicos do sistema
+# -----------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    make \
+    libpq-dev \
+    curl \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
 
-# =============================
-# Segurança / Criptografia
-# =============================
-cryptography==43.0.1
-python-jose==3.3.0
+# -----------------------------
+# 3) Copia requirements
+# -----------------------------
+COPY requirements.txt ./requirements.txt
 
-# =============================
-# Observabilidade / Métricas
-# =============================
-prometheus-client==0.20.0
-structlog==24.4.0
+# -----------------------------
+# 4) Instala dependências Python
+# -----------------------------
+RUN pip install --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir -r requirements.txt
 
-# =============================
-# GeoIP / Enriquecimento
-# =============================
-geoip2==4.8.0         # Leitura do banco MaxMind GeoLite2
-maxminddb==2.6.2      # Driver nativo do mmdb para alta performance
+# -----------------------------
+# 5) Copia todo o código (Bridge + BotGestor + configs)
+# -----------------------------
+COPY . .
 
-# =============================
-# Extras / Typing
-# =============================
-typing-extensions==4.12.2
+# -----------------------------
+# 6) Baixa banco GeoLite2 (GeoIP2)
+# -----------------------------
+RUN curl -L -o GeoLite2-City.mmdb.tar.gz \
+    https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-City.mmdb.tar.gz \
+    && tar -xvzf GeoLite2-City.mmdb.tar.gz --strip-components=1 -C /app \
+    && rm GeoLite2-City.mmdb.tar.gz
+
+# -----------------------------
+# 7) Expõe portas necessárias
+# -----------------------------
+EXPOSE 8080   # Bridge
+EXPOSE 8000   # Admin
+
+# -----------------------------
+# 8) Supervisord como entrypoint
+# -----------------------------
+CMD ["supervisord", "-c", "/app/supervisord.conf"]
