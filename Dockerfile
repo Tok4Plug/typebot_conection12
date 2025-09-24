@@ -1,7 +1,7 @@
 # =============================
 # Dockerfile — Bridge + BotGestor com supervisord + GeoIP (sem Docker Hub)
 # =============================
-FROM ghcr.io/library/python:3.11-slim
+FROM gcr.io/google-appengine/python
 
 # -----------------------------
 # 1) Variáveis globais
