@@ -185,3 +185,14 @@ async def process_event_queue():
     """
     tasks = [asyncio.create_task(_worker(i)) for i in range(QUEUE_WORKERS)]
     await asyncio.gather(*tasks)
+
+# =============================
+# Alias de compatibilidade
+# =============================
+
+async def send_event(event_type: str, lead: dict):
+    """
+    Wrapper de compatibilidade para o worker.py.
+    Internamente usa send_event_with_retry.
+    """
+    return await send_event_with_retry(event_type, lead)
