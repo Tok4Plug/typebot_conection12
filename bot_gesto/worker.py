@@ -14,6 +14,17 @@ CONSUMER = os.getenv("REDIS_CONSUMER", "worker-1")
 
 redis = Redis.from_url(REDIS_URL, decode_responses=True)
 
+# Garante que o grupo de consumidores exista
+try:
+    redis.xgroup_create(name=STREAM, groupname=GROUP, id="$", mkstream=True)
+    logger.info(f"[INIT] Grupo {GROUP} criado no stream {STREAM}")
+except Exception as e:
+    if "BUSYGROUP" in str(e):
+        logger.info(f"[INIT] Grupo {GROUP} já existe, seguindo...")
+    else:
+        logger.error(f"[INIT] Erro ao criar grupo {GROUP}: {e}")
+        raise
+
 # Logger básico (para aparecer no supervisord sem Illegal seek)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("worker")
