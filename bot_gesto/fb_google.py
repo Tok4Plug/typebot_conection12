@@ -1,7 +1,7 @@
 # fb_google.py — versão 2.0 avançada (sincronizado com bot/bridge/utils)
 import os, aiohttp, asyncio, json, logging
 from typing import Dict, Any
-from utils import build_fb_payload, build_ga4_payload
+from . import utils build_fb_payload, build_ga4_payload
 
 # =========================
 # Configurações de ENV
