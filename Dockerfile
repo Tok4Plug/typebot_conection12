@@ -1,20 +1,25 @@
 # =============================
-# Dockerfile — Bridge + typebot_conection.bot_gesto
+# Dockerfile — Bridge + bot_gesto
 # =============================
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# dependências do bridge
+# deps do bridge
 COPY requirements-bridge.txt ./requirements-bridge.txt
 RUN pip install --no-cache-dir -r requirements-bridge.txt
 
-# código inteiro
+# deps do bot_gesto
+COPY bot_gesto/requirements.txt ./bot_gesto/requirements.txt
+RUN pip install --no-cache-dir -r bot_gesto/requirements.txt
+
+# código
 COPY . .
 
-# garantir que o Python veja typebot_conection
-ENV PYTHONPATH=/app \
-    PYTHONUNBUFFERED=1 \
+# dica: se quiser fixar a raiz do bot, descomente a linha abaixo
+# ENV BRIDGE_BOT_DIR=/app/bot_gesto
+
+ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PORT=8080
 
