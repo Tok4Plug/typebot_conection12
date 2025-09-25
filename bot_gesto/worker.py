@@ -5,6 +5,16 @@ from bot_gesto.fb_google import send_event
 from bot_gesto.utils import derive_event_from_route, should_send_event
 
 # =============================
+# Logger
+# =============================
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger("worker")
+
+# =============================
 # Configurações
 # =============================
 REDIS_URL = os.getenv("REDIS_URL")
