@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from redis import Redis
 from cryptography.fernet import Fernet
+from fastapi.responses import RedirectResponse  # (NOVO) para redirecionar no /apply
 
 # ====== Logging JSON ======
 class JSONFormatter(logging.Formatter):
@@ -424,6 +425,7 @@ def _enrich_payload(data: dict, req: Request) -> dict:
         elif ck.get("cid_hint"):
             data["cid"] = ck["cid_hint"]
 
+    # >>> Patch de indentação correto (tudo dentro do if ip:)
     if ip:
         data.setdefault("ip", ip)
         geo = geo_lookup(ip)
@@ -585,3 +587,22 @@ async def bridge(
         authorization=authorization,
         event_type="Lead",
     )
+
+# (NOVO) endpoint fixo para o Bot A entregar — gera link dinâmico e redireciona
+@app.get("/apply")
+async def apply_redirect(
+    x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
+    authorization: Optional[str] = Header(default=None),
+    x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
+):
+    """
+    Entregável fixo para o Bot A.
+    - Gera um token dinâmico
+    - Armazena payload mínimo (pode ser enriquecido se você quiser passar querystrings no futuro)
+    - Redireciona para o deep link do Bot B
+    """
+    _auth_guard(x_api_key, x_bridge_token, authorization)
+    token = _make_token()
+    # guarda um payload básico (você pode evoluir para incluir request headers/qs)
+    redis.setex(_key(token), TOKEN_TTL_SEC, json.dumps({"source": "apply"}))
+    return RedirectResponse(url=_deep_link(token))
