@@ -552,6 +552,11 @@ def delete_token(
     redis.delete(_key(token))
     return {"deleted": True, "token": token}
 
+# =============================
+# app_bridge.py — v3.1 (Typebot-ready, enriquecimento e compat com bot_gesto)
+# =============================
+# ... [todo o código que você já mandou permanece igual acima] ...
+
 # 2) Endpoint universal para Typebot (INGEST)
 @app.post("/event")
 async def ingest_event(
@@ -568,9 +573,7 @@ async def ingest_event(
     - salva no DB (save_lead)
     - dispara pixels (send_event_to_all) com o event_type (default=Lead)
     """
-    # aceita BRIDGE_API_KEY (X-Api-Key), X-Bridge-Token e Authorization: Bearer
     _auth_guard(x_api_key, x_bridge_token, authorization)
-
     data = _enrich_payload(body.dict(by_alias=True, exclude_none=True), req)
 
     # salva e envia (compat sync/async)
@@ -588,7 +591,28 @@ async def webhook(
     authorization: Optional[str] = Header(default=None),
     x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
 ):
-    # Reusa a mesma guarda e pipeline do /event, mantendo compat e lógica intacta
+    return await ingest_event(
+        req=req,
+        body=body,
+        x_bridge_token=x_bridge_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+        event_type="Lead",
+    )
+
+# (NOVO) alias compatível para Typebot -> /bridge
+@app.post("/bridge")
+async def bridge(
+    req: Request,
+    body: TBPayload,
+    x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
+    authorization: Optional[str] = Header(default=None),
+    x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
+):
+    """
+    Alias de /event, criado para compatibilidade direta com Typebot.
+    Permite que o Typebot poste em /bridge sem retornar erro 405.
+    """
     return await ingest_event(
         req=req,
         body=body,
