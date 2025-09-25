@@ -424,10 +424,7 @@ def _enrich_payload(data: dict, req: Request) -> dict:
         elif ck.get("cid_hint"):
             data["cid"] = ck["cid_hint"]
 
-    if ip:
-        data.setdefault("ip", ip)
-        geo = geo_lookup(ip)
-        if ip:
+if ip:
     data.setdefault("ip", ip)
     geo = geo_lookup(ip)
     if geo:
