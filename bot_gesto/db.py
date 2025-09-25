@@ -1,11 +1,11 @@
-# db.py — versão 2.0 avançada e sincronizada
+# db.py — versão 3.0 robusta (Lead + Subscribe com redundância e logs detalhados)
 import os, asyncio, json, time, hashlib, base64, logging
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 
 import sys
 sys.path.append(os.path.dirname(__file__))
-import utils  # agora funciona SEM erro
+import utils  # mantém compatibilidade
 
 from sqlalchemy import (
     create_engine, Column, Integer, String, Boolean,
@@ -25,7 +25,7 @@ logging.basicConfig(
 logger = logging.getLogger("db")
 
 # ==============================
-# Criptografia (Fernet com fallback base64)
+# Criptografia
 # ==============================
 CRYPTO_KEY = os.getenv("CRYPTO_KEY")
 _use_fernet, _fernet = False, None
@@ -135,7 +135,7 @@ def init_db():
         logger.error(f"Erro init DB: {e}")
 
 # ==============================
-# Priority Score (inteligente)
+# Priority Score
 # ==============================
 def compute_priority_score(user_data: Dict[str, Any], custom_data: Dict[str, Any]) -> float:
     score = 0.0
@@ -151,9 +151,13 @@ def compute_priority_score(user_data: Dict[str, Any], custom_data: Dict[str, Any
     return score
 
 # ==============================
-# Save Lead (insert/update idempotente)
+# Save Lead (insert/update explícito para Lead/Subscribe)
 # ==============================
 async def save_lead(data: dict, event_record: Optional[dict] = None, retries: int = 3) -> bool:
+    """
+    Salva/atualiza um Lead OU Subscribe de forma idempotente.
+    Mantém histórico separado, sem misturar os dois tipos de evento.
+    """
     if not SessionLocal:
         logger.warning("DB desativado - save_lead ignorado")
         return False
@@ -167,7 +171,9 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
             try:
                 ek = data.get("event_key")
                 telegram_id = str(data.get("telegram_id"))
+                etype = data.get("event_type") or "Lead"
                 if not ek or not telegram_id:
+                    logger.warning(f"[SAVE_LEAD] evento inválido: ek={ek} tg={telegram_id}")
                     return False
 
                 lead = session.query(Lead).filter(Lead.event_key == ek).first()
@@ -181,9 +187,10 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
                     enc_cookies = {k: _encrypt_value(v) for k, v in data["cookies"].items()}
 
                 if lead:
-                    # update
+                    logger.info(f"[DB_UPDATE] Atualizando ek={ek} tipo={etype}")
                     lead.user_data = {**(lead.user_data or {}), **normalized_ud}
                     lead.custom_data = {**(lead.custom_data or {}), **custom}
+                    lead.event_type = etype
                     lead.src_url = data.get("src_url") or lead.src_url
                     lead.currency = data.get("currency") or lead.currency
                     if enc_cookies:
@@ -197,11 +204,11 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
                         eh.append({**event_record, "ts": datetime.now(timezone.utc).isoformat()})
                         lead.event_history = eh
                 else:
-                    # insert
+                    logger.info(f"[DB_INSERT] Inserindo ek={ek} tipo={etype}")
                     lead = Lead(
                         event_key=ek,
                         telegram_id=telegram_id,
-                        event_type=data.get("event_type"),
+                        event_type=etype,
                         route_key=data.get("route_key"),
                         src_url=data.get("src_url"),
                         value=data.get("value"),
@@ -319,7 +326,7 @@ async def get_historical_leads(limit: int = 50) -> List[Dict[str, Any]]:
     return await loop.run_in_executor(None, db_sync)
 
 # ==============================
-# Sincronizar leads pendentes (retrofeed FB + Google)
+# Sincronizar leads pendentes
 # ==============================
 async def sync_pending_leads(batch_size: int = 20) -> int:
     if not SessionLocal:

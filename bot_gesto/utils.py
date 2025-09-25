@@ -1,4 +1,4 @@
-# utils.py — versão 2.0 avançada (sincronizado com bridge/bot/fb_google)
+# utils.py — versão 2.1 avançada (sincronizado com bridge/bot/fb_google, enriquecimento Lead+Subscribe)
 import os, re, time, hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
@@ -45,6 +45,7 @@ def clamp_event_time(ts: int) -> int:
 def build_event_id(event_name: str, lead: Dict[str, Any], event_time: int) -> str:
     """
     Cria um ID único e determinístico para deduplicar eventos no Facebook.
+    Usa salt fixo para evitar colisões.
     """
     keys = [
         _norm(str(event_name)),
@@ -67,7 +68,7 @@ def build_event_id(event_name: str, lead: Dict[str, Any], event_time: int) -> st
 def normalize_user_data(raw: Dict[str, Any]) -> Dict[str, Any]:
     """
     Prepara user_data para o Facebook CAPI (hashing SHA256 quando requerido).
-    Foca em enriquecer o máximo possível mesmo sem email/telefone.
+    Enriquecido: cobre email, telefone, nome, localização, IDs técnicos.
     """
     if not raw:
         return {}
@@ -93,11 +94,11 @@ def normalize_user_data(raw: Dict[str, Any]) -> Dict[str, Any]:
     if zp:      ud["zp"] = _sha256(zp)
     if external_id: ud["external_id"] = _sha256(external_id)
 
-    # Identificadores de tracking diretos
+    # Identificadores diretos
     if raw.get("fbp"): ud["fbp"] = raw.get("fbp")
     if raw.get("fbc"): ud["fbc"] = raw.get("fbc")
 
-    # Dados técnicos que aumentam match rate
+    # Dados técnicos
     if raw.get("ip"): ud["client_ip_address"] = raw.get("ip")
     if raw.get("ua"): ud["client_user_agent"] = raw.get("ua")
 
@@ -107,6 +108,10 @@ def normalize_user_data(raw: Dict[str, Any]) -> Dict[str, Any]:
 # Escolha do evento (Lead/Subscribe)
 # ==============================
 def derive_event_from_route(route_key: str) -> str | None:
+    """
+    Decide dinamicamente se a rota representa Lead ou Subscribe,
+    com base em SEND_LEAD_ON / SEND_SUBSCRIBE_ON.
+    """
     r = (route_key or "").lower()
     if SEND_SUBSCRIBE_ON and SEND_SUBSCRIBE_ON in r:
         return "Subscribe"
@@ -115,6 +120,9 @@ def derive_event_from_route(route_key: str) -> str | None:
     return None
 
 def should_send_event(event_name: str) -> bool:
+    """
+    Define se evento deve ser enviado ao pixel.
+    """
     if not event_name:
         return False
     e = event_name.lower()
@@ -125,7 +133,8 @@ def should_send_event(event_name: str) -> bool:
 # ==============================
 def build_fb_payload(pixel_id: str, event_name: str, lead: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Monta o payload completo para envio ao Facebook CAPI.
+    Monta payload completo para envio ao Facebook CAPI.
+    Enriquecimento avançado: inclui dados UTM, device_info e deduplicação.
     """
     raw_time = int(lead.get("event_time") or now_ts())
     etime = clamp_event_time(raw_time)
@@ -134,7 +143,7 @@ def build_fb_payload(pixel_id: str, event_name: str, lead: Dict[str, Any]) -> Di
     # Normalização user_data
     user_data = normalize_user_data(lead.get("user_data") or lead)
 
-    # Enriquecimento custom_data (ads insights)
+    # Enriquecimento custom_data
     custom_data = {
         "currency": lead.get("currency") or "BRL",
         "value": lead.get("value") or 0,
@@ -143,12 +152,12 @@ def build_fb_payload(pixel_id: str, event_name: str, lead: Dict[str, Any]) -> Di
         "utm_campaign": lead.get("utm_campaign"),
         "utm_term": lead.get("utm_term"),
         "utm_content": lead.get("utm_content"),
-        "device": (lead.get("device_info") or {}).get("device"),
-        "os": (lead.get("device_info") or {}).get("os"),
+        "device": (lead.get("device_info") or {}).get("device") or lead.get("device"),
+        "os": (lead.get("device_info") or {}).get("os") or lead.get("os"),
     }
     custom_data = {k: v for k, v in custom_data.items() if v}
 
-    # event_source_url → origem real
+    # event_source_url real
     event_source_url = (
         lead.get("event_source_url")
         or lead.get("src_url")
@@ -156,6 +165,7 @@ def build_fb_payload(pixel_id: str, event_name: str, lead: Dict[str, Any]) -> Di
         or (lead.get("device_info") or {}).get("url")
     )
 
+    # payload final
     return {
         "data": [{
             "event_name": event_name,
@@ -182,6 +192,7 @@ def to_ga4_event_name(event_name: str) -> str:
 def build_ga4_payload(event_name: str, lead: Dict[str, Any]) -> Dict[str, Any]:
     """
     Monta payload para envio ao GA4 (Measurement Protocol).
+    Enriquecido com UTM, device e suporte a client_id/telegram_id.
     """
     client_id = (
         lead.get("gclid")
@@ -200,8 +211,8 @@ def build_ga4_payload(event_name: str, lead: Dict[str, Any]) -> Dict[str, Any]:
         "event_source_url": lead.get("event_source_url") or lead.get("landing_url"),
         "currency": lead.get("currency") or "BRL",
         "value": lead.get("value") or 0,
-        "device": (lead.get("device_info") or {}).get("device"),
-        "os": (lead.get("device_info") or {}).get("os"),
+        "device": (lead.get("device_info") or {}).get("device") or lead.get("device"),
+        "os": (lead.get("device_info") or {}).get("os") or lead.get("os"),
     }
     params = {k: v for k, v in params.items() if v}
 

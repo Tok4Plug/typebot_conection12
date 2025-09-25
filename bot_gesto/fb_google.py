@@ -1,5 +1,5 @@
-# fb_google.py — versão 2.0 avançada (sincronizado com bot/bridge)
-import os, aiohttp, asyncio, json, logging
+# fb_google.py — versão 2.1 avançada (sincronizado com bot/bridge, entrelaçando Lead/Subscribe)
+import os, aiohttp, asyncio, json, logging, copy
 from typing import Dict, Any
 
 # Ajuste de path para permitir import de utils
@@ -55,6 +55,10 @@ async def post_with_retry(session, url: str, payload: Dict[str, Any], retries: i
 # Envio para Facebook CAPI
 # =========================
 async def send_event_fb(event_name: str, lead: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Dispara evento para o Facebook CAPI.
+    Retorna o status da operação (ok, status, erro).
+    """
     if not FB_PIXEL_ID or not FB_ACCESS_TOKEN:
         return {"skip": True, "reason": "fb creds missing"}
 
@@ -78,6 +82,10 @@ async def send_event_fb(event_name: str, lead: Dict[str, Any]) -> Dict[str, Any]
 # Envio para Google GA4
 # =========================
 async def send_event_google(event_name: str, lead: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Dispara evento para o Google Analytics 4.
+    Retorna o status da operação (ok, status, erro).
+    """
     if not GOOGLE_ENABLED:
         return {"skip": True, "reason": "google disabled"}
 
@@ -105,10 +113,24 @@ async def send_event_to_all(lead: Dict[str, Any], et: str = "Lead") -> Dict[str,
     Dispara evento (Lead/Subscribe) para:
       - Facebook (sempre)
       - Google GA4 (se configurado)
+
+    🔄 Melhorado: se o evento for Lead,
+    também dispara Subscribe automaticamente.
     """
-    results: Dict[str, Any] = {"facebook": await send_event_fb(et, lead)}
+    results: Dict[str, Any] = {}
+
+    # envia evento principal
+    results["facebook"] = await send_event_fb(et, lead)
     if GOOGLE_ENABLED:
         results["google"] = await send_event_google(et, lead)
+
+    # nova lógica: se for Lead, também envia Subscribe (sem duplicação)
+    if et.lower() == "lead":
+        subscribe_lead = copy.deepcopy(lead)
+        subscribe_lead["subscribe_from_lead"] = True  # flag para auditoria
+        results["facebook_subscribe"] = await send_event_fb("Subscribe", subscribe_lead)
+        if GOOGLE_ENABLED:
+            results["google_subscribe"] = await send_event_google("Subscribe", subscribe_lead)
 
     logger.info(json.dumps({
         "event": "SEND_EVENT_TO_ALL",
@@ -123,6 +145,10 @@ async def send_event_to_all(lead: Dict[str, Any], et: str = "Lead") -> Dict[str,
 # =========================
 async def send_event_with_retry(event_type: str, lead: Dict[str, Any],
                                 retries: int = 5, delay: float = 2.0) -> Dict[str, Any]:
+    """
+    Wrapper com retry exponencial para garantir envio confiável.
+    Se falhar em todas as tentativas, retorna status=failed.
+    """
     attempt = 0
     while attempt < retries:
         try:
@@ -154,7 +180,9 @@ async def send_event_with_retry(event_type: str, lead: Dict[str, Any],
 _event_queue: asyncio.Queue = asyncio.Queue()
 
 async def enqueue_event(event_type: str, lead: Dict[str, Any]) -> None:
-    """Coloca evento na fila para envio posterior (worker processa)."""
+    """
+    Coloca evento na fila para envio posterior (worker processa).
+    """
     await _event_queue.put((event_type, lead))
     logger.info(json.dumps({
         "event": "QUEUE_ENQ",
@@ -163,7 +191,9 @@ async def enqueue_event(event_type: str, lead: Dict[str, Any]) -> None:
     }))
 
 async def _worker(worker_id: int):
-    """Worker que consome eventos da fila e envia para os pixels."""
+    """
+    Worker que consome eventos da fila e envia para os pixels.
+    """
     while True:
         event_type, lead = await _event_queue.get()
         try:
@@ -189,7 +219,6 @@ async def process_event_queue():
 # =============================
 # Alias de compatibilidade
 # =============================
-
 async def send_event(event_type: str, lead: dict):
     """
     Wrapper de compatibilidade para o worker.py.
