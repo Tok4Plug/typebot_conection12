@@ -336,6 +336,10 @@ class TBPayload(BaseModel):
     value: Optional[float] = None
     currency: Optional[str] = None
 
+    # identificação adicional (mantém compat)
+    telegram_id: Optional[str] = None
+    event: Optional[str] = None
+
     # extra livre
     extra: Optional[Dict[str, Any]] = None
 
@@ -353,7 +357,7 @@ def _deep_link(token: str) -> str:
     return f"https://t.me/{BOT_USERNAME}?start=t_{token}"
 
 def _pick_effective_token() -> Optional[str]:
-    # preferência: BRIDGE_API_KEY, senão BRIDGE_TOKEN
+    # preferência: BRIDGE_API_KEY, senão BRIDGE_TOKEN (mantém compat)
     return BRIDGE_API_KEY or BRIDGE_TOKEN or None
 
 def _parse_authorization(header_val: Optional[str]) -> Optional[str]:
@@ -369,9 +373,15 @@ def _auth_guard(
     x_bridge_token: Optional[str],
     authorization: Optional[str],
 ):
+    """
+    Aceita:
+      - X-Api-Key: <token>
+      - X-Bridge-Token: <token>
+      - Authorization: Bearer <token>
+    Se BRIDGE_API_KEY/BRIDGE_TOKEN estiverem vazios => endpoint público (compat).
+    """
     expected = _pick_effective_token()
     if not expected:
-        # sem token configurado -> endpoint público (mantém comportamento prévio se BRIDGE_API_KEY vazio)
         return
     bearer = _parse_authorization(authorization)
     supplied = x_api_key or x_bridge_token or bearer
@@ -498,6 +508,11 @@ def health():
         "ls_chosen": _ls(IMPORT_INFO.get("chosen_dir")),
     }
 
+# Anti-405 para browsers e edge proxies (CORS preflight)
+@app.options("/{full_path:path}")
+async def options_ok(full_path: str):
+    return {}
+
 # 1) Deep link flow (opcional)
 @app.post("/tb/link")
 async def create_deeplink(
@@ -573,4 +588,12 @@ async def webhook(
     authorization: Optional[str] = Header(default=None),
     x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
 ):
-    return await ingest_event(req, body, x_bridge_token=x_bridge_token, x_api_key=x_api_key, authorization=authorization)
+    # Reusa a mesma guarda e pipeline do /event, mantendo compat e lógica intacta
+    return await ingest_event(
+        req=req,
+        body=body,
+        x_bridge_token=x_bridge_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+        event_type="Lead",
+    )
