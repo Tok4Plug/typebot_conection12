@@ -1,5 +1,5 @@
 # =============================
-# app_bridge.py — v3.0 (Typebot-ready, enriquecimento e compat com bot_gesto)
+# app_bridge.py — v3.1 (Typebot-ready, enriquecimento e compat com bot_gesto)
 # =============================
 import os, sys, json, time, secrets, logging, asyncio, base64, hashlib, importlib.util
 from typing import Optional, Dict, Any, List, Tuple
@@ -287,7 +287,7 @@ def parse_ua(ua: Optional[str]) -> Dict[str, Any]:
     return {"ua": ua}
 
 # ====== App & CORS ======
-app = FastAPI(title="Typebot Bridge", version="3.0.0")
+app = FastAPI(title="Typebot Bridge", version="3.1.0")
 if ALLOWED_ORIGINS:
     app.add_middleware(
         CORSMiddleware,
@@ -299,16 +299,13 @@ if ALLOWED_ORIGINS:
 
 # ====== Schemas ======
 class TBPayload(BaseModel):
-    # cookies/ids
     _fbp: Optional[str] = None
     _fbc: Optional[str] = None
     fbclid: Optional[str] = None
     gclid: Optional[str] = None
     gbraid: Optional[str] = None
     wbraid: Optional[str] = None
-    cid: Optional[str] = None  # GA cid
-
-    # urls/utm
+    cid: Optional[str] = None
     landing_url: Optional[str] = None
     event_source_url: Optional[str] = None
     utm_source: Optional[str] = None
@@ -316,13 +313,9 @@ class TBPayload(BaseModel):
     utm_campaign: Optional[str] = None
     utm_term: Optional[str] = None
     utm_content: Optional[str] = None
-
-    # device
     device: Optional[str] = None
     os: Optional[str] = None
     user_agent: Optional[str] = Field(default=None, alias="user_agent")
-
-    # lead fields
     email: Optional[str] = None
     phone: Optional[str] = None
     first_name: Optional[str] = None
@@ -331,16 +324,10 @@ class TBPayload(BaseModel):
     state: Optional[str] = None
     zip: Optional[str] = None
     country: Optional[str] = None
-
-    # commerce
     value: Optional[float] = None
     currency: Optional[str] = None
-
-    # identificação adicional (mantém compat)
     telegram_id: Optional[str] = None
     event: Optional[str] = None
-
-    # extra livre
     extra: Optional[Dict[str, Any]] = None
 
     class Config:
@@ -357,7 +344,6 @@ def _deep_link(token: str) -> str:
     return f"https://t.me/{BOT_USERNAME}?start=t_{token}"
 
 def _pick_effective_token() -> Optional[str]:
-    # preferência: BRIDGE_API_KEY, senão BRIDGE_TOKEN (mantém compat)
     return BRIDGE_API_KEY or BRIDGE_TOKEN or None
 
 def _parse_authorization(header_val: Optional[str]) -> Optional[str]:
@@ -373,13 +359,6 @@ def _auth_guard(
     x_bridge_token: Optional[str],
     authorization: Optional[str],
 ):
-    """
-    Aceita:
-      - X-Api-Key: <token>
-      - X-Bridge-Token: <token>
-      - Authorization: Bearer <token>
-    Se BRIDGE_API_KEY/BRIDGE_TOKEN estiverem vazios => endpoint público (compat).
-    """
     expected = _pick_effective_token()
     if not expected:
         return
@@ -398,7 +377,6 @@ def _auth_guard(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 def _extract_client_ip(req: Request) -> Optional[str]:
-    # ordem de preferência (Railway/CF)
     for h in ["CF-Connecting-IP", "X-Real-IP", "X-Forwarded-For"]:
         v = req.headers.get(h)
         if v:
@@ -416,16 +394,9 @@ def _parse_cookies(header_cookie: Optional[str]) -> Dict[str, Any]:
                 out[k.strip()] = v.strip()
     except Exception:
         pass
-    # mapeia padrões comuns
-    if "_fbp" in out and not out.get("_fbp"):
-        out["_fbp"] = out["_fbp"]
-    if "_fbc" in out and not out.get("_fbc"):
-        out["_fbc"] = out["_fbc"]
-    # GA cookie -> cid simples (se não vier explícito)
     ga = out.get("_ga")
     if ga and "GA" in ga and not out.get("cid"):
         try:
-            # formatos: GA1.1.XXXXXXXX.XXXXXXXX
             parts = ga.split(".")
             if len(parts) >= 4:
                 out["cid_hint"] = f"{parts[-2]}.{parts[-1]}"
@@ -434,14 +405,10 @@ def _parse_cookies(header_cookie: Optional[str]) -> Dict[str, Any]:
     return out
 
 def _enrich_payload(data: dict, req: Request) -> dict:
-    # headers / ip / ua
     ip = _extract_client_ip(req)
     ua = data.get("user_agent") or req.headers.get("user-agent")
-
-    # cookies
     ck = _parse_cookies(req.headers.get("cookie"))
 
-    # preenche IDs
     if data.get("fbclid") and not data.get("_fbc"):
         data["_fbc"] = f"fb.1.{int(time.time())}.{data['fbclid']}"
     if not data.get("_fbp"):
@@ -457,15 +424,17 @@ def _enrich_payload(data: dict, req: Request) -> dict:
         elif ck.get("cid_hint"):
             data["cid"] = ck["cid_hint"]
 
-    # geo e ua
     if ip:
         data.setdefault("ip", ip)
         geo = geo_lookup(ip)
-        if geo:
-            data.setdefault("geo", geo)
-            data.setdefault("country", data.get("country") or geo.get("country"))
-            data.setdefault("city", data.get("city") or geo.get("city"))
-            data.setdefault("state", data.get("state") or geo.get("region"))
+        if ip:
+    data.setdefault("ip", ip)
+    geo = geo_lookup(ip)
+    if geo:
+        data.setdefault("geo", geo)
+        data.setdefault("country", data.get("country") or geo.get("country"))
+        data.setdefault("city", data.get("city") or geo.get("city"))
+        data.setdefault("state", data.get("state") or geo.get("region"))
 
     ua_info = parse_ua(ua)
     if ua_info:
@@ -552,11 +521,6 @@ def delete_token(
     redis.delete(_key(token))
     return {"deleted": True, "token": token}
 
-# =============================
-# app_bridge.py — v3.1 (Typebot-ready, enriquecimento e compat com bot_gesto)
-# =============================
-# ... [todo o código que você já mandou permanece igual acima] ...
-
 # 2) Endpoint universal para Typebot (INGEST)
 @app.post("/event")
 async def ingest_event(
@@ -573,7 +537,9 @@ async def ingest_event(
     - salva no DB (save_lead)
     - dispara pixels (send_event_to_all) com o event_type (default=Lead)
     """
+    # aceita BRIDGE_API_KEY (X-Api-Key), X-Bridge-Token e Authorization: Bearer
     _auth_guard(x_api_key, x_bridge_token, authorization)
+
     data = _enrich_payload(body.dict(by_alias=True, exclude_none=True), req)
 
     # salva e envia (compat sync/async)
@@ -591,6 +557,7 @@ async def webhook(
     authorization: Optional[str] = Header(default=None),
     x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
 ):
+    # Reusa a mesma guarda e pipeline do /event, mantendo compat e lógica intacta
     return await ingest_event(
         req=req,
         body=body,
