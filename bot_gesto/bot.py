@@ -1,4 +1,4 @@
-# bot.py — versão 2.4 com Invite Link em mensagem separada
+# bot.py — versão 2.4 com Invite Link em mensagem separada + atualização de enriquecimento/sincronia
 import os, logging, json, asyncio, time
 from datetime import datetime
 from typing import Dict, Any, Optional
@@ -222,17 +222,9 @@ async def send_event_with_retry(event_type: str, lead: Dict[str, Any], retries: 
 # =============================
 async def send_vip_message_with_preview(msg: types.Message, first_name: str, vip_link: str):
     try:
-        # Mensagem 1: header sem links
         await msg.answer(f"✅ <b>{first_name}</b>, seu acesso VIP foi liberado!\nLink exclusivo expira em 24h.")
-
         await asyncio.sleep(0.3)
-
-        # Mensagem 2: apenas a URL do invite, sozinha (força preview)
-        await bot.send_message(
-            msg.chat.id,
-            vip_link,
-           
-        )
+        await bot.send_message(msg.chat.id, vip_link)
     except Exception as e:
         logger.error(json.dumps({"event": "PREVIEW_SEND", "error": str(e)}))
         await msg.answer(f"🔑 Acesse aqui: {vip_link}", disable_web_page_preview=False)
@@ -248,6 +240,7 @@ async def process_new_lead(msg: types.Message):
     vip_link = await generate_vip_link(lead["event_key"])
 
     try:
+        # mantém lógica: envia Lead e Subscribe juntos
         await enqueue_event("Lead", {"event_key": lead["event_key"], "telegram_id": lead["telegram_id"]})
         await enqueue_event("Subscribe", {"event_key": lead["event_key"], "telegram_id": lead["telegram_id"]})
     except Exception as e:
