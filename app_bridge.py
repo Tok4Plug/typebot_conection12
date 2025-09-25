@@ -424,14 +424,14 @@ def _enrich_payload(data: dict, req: Request) -> dict:
         elif ck.get("cid_hint"):
             data["cid"] = ck["cid_hint"]
 
-if ip:
-    data.setdefault("ip", ip)
-    geo = geo_lookup(ip)
-    if geo:
-        data.setdefault("geo", geo)
-        data.setdefault("country", data.get("country") or geo.get("country"))
-        data.setdefault("city", data.get("city") or geo.get("city"))
-        data.setdefault("state", data.get("state") or geo.get("region"))
+    if ip:
+        data.setdefault("ip", ip)
+        geo = geo_lookup(ip)
+        if geo:
+            data.setdefault("geo", geo)
+            data.setdefault("country", data.get("country") or geo.get("country"))
+            data.setdefault("city", data.get("city") or geo.get("city"))
+            data.setdefault("state", data.get("state") or geo.get("region"))
 
     ua_info = parse_ua(ua)
     if ua_info:
