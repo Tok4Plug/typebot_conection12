@@ -199,6 +199,7 @@ REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 BOT_USERNAME    = os.getenv("BOT_USERNAME", "").lstrip("@")
 TOKEN_TTL_SEC   = int(os.getenv("TOKEN_TTL_SEC", "3600"))
 BRIDGE_API_KEY  = os.getenv("BRIDGE_API_KEY", "")
+BRIDGE_TOKEN    = os.getenv("BRIDGE_TOKEN", "")
 ALLOWED_ORIGINS = [o.strip() for o in (os.getenv("ALLOWED_ORIGINS", "") or "").split(",") if o.strip()]
 PORT            = int(os.getenv("PORT", "8080"))
 
@@ -212,7 +213,25 @@ fernet = None
 if CRYPTO_KEY:
     derived = base64.urlsafe_b64encode(hashlib.sha256(CRYPTO_KEY.encode()).digest())
     fernet = Fernet(derived)
-    logger.info("✅ Crypto habilitado")
+    logger.info("✅ Cripto: Fernet habilitado")
+
+# Log não-sensível de config (sem vazar tokens)
+def _mask(v: str) -> str:
+    if not v:
+        return ""
+    if len(v) <= 6:
+        return "***"
+    return v[:3] + "***" + v[-3:]
+
+logger.info(json.dumps({
+    "event": "BRIDGE_CONFIG",
+    "has_bridge_api_key": bool(BRIDGE_API_KEY),
+    "has_bridge_token": bool(BRIDGE_TOKEN),
+    "bridge_api_key_masked": _mask(BRIDGE_API_KEY),
+    "bridge_token_masked": _mask(BRIDGE_TOKEN),
+    "bot_username_set": bool(BOT_USERNAME),
+    "allowed_origins": ALLOWED_ORIGINS,
+}))
 
 if not BOT_USERNAME:
     raise RuntimeError("BOT_USERNAME não configurado (ex.: SeuBotUsername)")
@@ -333,8 +352,39 @@ def _key(token: str) -> str:
 def _deep_link(token: str) -> str:
     return f"https://t.me/{BOT_USERNAME}?start=t_{token}"
 
-def _auth_guard(x_api_key: Optional[str]):
-    if BRIDGE_API_KEY and (x_api_key != BRIDGE_API_KEY):
+def _pick_effective_token() -> Optional[str]:
+    # preferência: BRIDGE_API_KEY, senão BRIDGE_TOKEN
+    return BRIDGE_API_KEY or BRIDGE_TOKEN or None
+
+def _parse_authorization(header_val: Optional[str]) -> Optional[str]:
+    if not header_val:
+        return None
+    parts = header_val.strip().split()
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1]
+    return None
+
+def _auth_guard(
+    x_api_key: Optional[str],
+    x_bridge_token: Optional[str],
+    authorization: Optional[str],
+):
+    expected = _pick_effective_token()
+    if not expected:
+        # sem token configurado -> endpoint público (mantém comportamento prévio se BRIDGE_API_KEY vazio)
+        return
+    bearer = _parse_authorization(authorization)
+    supplied = x_api_key or x_bridge_token or bearer
+    if supplied != expected:
+        logger.warning(json.dumps({
+            "event": "AUTH_FAIL",
+            "reason": "token_mismatch",
+            "got_headers": {
+                "has_x_api_key": bool(x_api_key),
+                "has_x_bridge_token": bool(x_bridge_token),
+                "has_authorization_bearer": bool(bearer),
+            }
+        }))
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 def _extract_client_ip(req: Request) -> Optional[str]:
@@ -453,9 +503,11 @@ def health():
 async def create_deeplink(
     req: Request,
     body: TBPayload,
-    x_api_key: Optional[str] = Header(default=None, convert_underscores=False)
+    x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
+    authorization: Optional[str] = Header(default=None),
+    x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
 ):
-    _auth_guard(x_api_key)
+    _auth_guard(x_api_key, x_bridge_token, authorization)
     data = _enrich_payload(body.dict(by_alias=True, exclude_none=True), req)
     token = _make_token()
     redis.setex(_key(token), TOKEN_TTL_SEC, json.dumps(data))
@@ -464,9 +516,11 @@ async def create_deeplink(
 @app.get("/tb/peek/{token}")
 def peek_token(
     token: str,
-    x_api_key: Optional[str] = Header(default=None, convert_underscores=False)
+    x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
+    authorization: Optional[str] = Header(default=None),
+    x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
 ):
-    _auth_guard(x_api_key)
+    _auth_guard(x_api_key, x_bridge_token, authorization)
     blob = redis.get(_key(token))
     if not blob:
         raise HTTPException(status_code=404, detail="token not found/expired")
@@ -475,9 +529,11 @@ def peek_token(
 @app.delete("/tb/del/{token}")
 def delete_token(
     token: str,
-    x_api_key: Optional[str] = Header(default=None, convert_underscores=False)
+    x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
+    authorization: Optional[str] = Header(default=None),
+    x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
 ):
-    _auth_guard(x_api_key)
+    _auth_guard(x_api_key, x_bridge_token, authorization)
     redis.delete(_key(token))
     return {"deleted": True, "token": token}
 
@@ -488,6 +544,7 @@ async def ingest_event(
     body: TBPayload,
     x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
     x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
+    authorization: Optional[str] = Header(default=None),
     event_type: Optional[str] = "Lead"
 ):
     """
@@ -496,10 +553,8 @@ async def ingest_event(
     - salva no DB (save_lead)
     - dispara pixels (send_event_to_all) com o event_type (default=Lead)
     """
-    # aceita tanto BRIDGE_API_KEY (X-Api-Key) quanto X-Bridge-Token
-    if BRIDGE_API_KEY:
-        if not (x_api_key == BRIDGE_API_KEY or x_bridge_token == BRIDGE_API_KEY):
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    # aceita BRIDGE_API_KEY (X-Api-Key), X-Bridge-Token e Authorization: Bearer
+    _auth_guard(x_api_key, x_bridge_token, authorization)
 
     data = _enrich_payload(body.dict(by_alias=True, exclude_none=True), req)
 
@@ -514,6 +569,8 @@ async def ingest_event(
 async def webhook(
     req: Request,
     body: TBPayload,
-    x_api_key: Optional[str] = Header(default=None, convert_underscores=False)
+    x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
+    authorization: Optional[str] = Header(default=None),
+    x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
 ):
-    return await ingest_event(req, body, x_api_key=x_api_key)
+    return await ingest_event(req, body, x_bridge_token=x_bridge_token, x_api_key=x_api_key, authorization=authorization)
