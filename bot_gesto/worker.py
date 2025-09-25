@@ -8,6 +8,7 @@ from bot_gesto.utils import derive_event_from_route, should_send_event
 # Logger
 # =============================
 import logging
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -24,14 +25,19 @@ CONSUMER = os.getenv("REDIS_CONSUMER", "worker-1")
 
 redis = Redis.from_url(REDIS_URL, decode_responses=True)
 
+# =============================
 # Garante que o grupo de consumidores exista
+# =============================
 try:
     redis.xgroup_create(name=STREAM, groupname=GROUP, id="$", mkstream=True)
+    print(f"[INIT] Grupo {GROUP} criado no stream {STREAM}")
     logger.info(f"[INIT] Grupo {GROUP} criado no stream {STREAM}")
 except Exception as e:
     if "BUSYGROUP" in str(e):
+        print(f"[INIT] Grupo {GROUP} já existe, seguindo...")
         logger.info(f"[INIT] Grupo {GROUP} já existe, seguindo...")
     else:
+        print(f"[INIT] Erro ao criar grupo {GROUP}: {e}")
         logger.error(f"[INIT] Erro ao criar grupo {GROUP}: {e}")
         raise
 
@@ -53,6 +59,7 @@ async def process_entry(entry_id, entry_data):
         ld = json.loads(entry_data.get("payload", "{}"))
     except Exception as e:
         print(f"[ERRO] Parse payload {entry_id}: {e}")
+        logger.error(f"[ERRO] Parse payload {entry_id}: {e}")
         return
 
     # Determina qual evento disparar (Lead / Subscribe)
@@ -61,13 +68,20 @@ async def process_entry(entry_id, entry_data):
 
     if not should_send_event(event):
         print(f"[SKIP] {entry_id} evento não permitido ou não reconhecido -> {event}")
+        logger.warning(f"[SKIP] {entry_id} evento não permitido ou não reconhecido -> {event}")
         return
 
     print(f"[EVENT] {entry_id} -> {event} para lead {ld.get('telegram_id') or ld.get('external_id')}")
+    logger.info(f"[EVENT] {entry_id} -> {event} para lead {ld.get('telegram_id') or ld.get('external_id')}")
 
     # Envia para Facebook + Google
-    results = await send_event(event, ld)
-    print(f"[RESULT] {entry_id}: {results}")
+    try:
+        results = await send_event(event, ld)
+        print(f"[RESULT] {entry_id}: {results}")
+        logger.info(f"[RESULT] {entry_id}: {results}")
+    except Exception as e:
+        print(f"[ERRO] Falha ao enviar evento {entry_id}: {e}")
+        logger.error(f"[ERRO] Falha ao enviar evento {entry_id}: {e}")
 
 async def process_batch():
     """
@@ -86,6 +100,7 @@ async def process_batch():
                     redis.xack(STREAM, GROUP, entry_id)
         except Exception as e:
             print(f"[ERRO LOOP] {e}")
+            logger.error(f"[ERRO LOOP] {e}")
             await asyncio.sleep(2)
 
 # =========================
@@ -94,6 +109,7 @@ async def process_batch():
 def shutdown(sig, frame):
     global running
     print(f"[STOP] Signal {sig}, encerrando...")
+    logger.warning(f"[STOP] Signal {sig}, encerrando...")
     running = False
 
 signal.signal(signal.SIGINT, shutdown)
@@ -108,3 +124,4 @@ if __name__ == "__main__":
         loop.run_until_complete(process_batch())
     except KeyboardInterrupt:
         print("Encerrado manualmente.")
+        logger.warning("Encerrado manualmente.")
