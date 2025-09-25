@@ -18,7 +18,7 @@ python-dotenv==1.0.1       # Carregar variáveis de ambiente (.env)
 # =============================
 # HTTP Requests / Async
 # =============================
-aiohttp==3.9.5             # HTTP client assíncrono (leve e rápido)
+aiohttp==3.8.6             # Compatível com aiogram 2.25.2 e geoip2
 httpx==0.27.0              # Cliente HTTP moderno com suporte a sync/async
 
 # =============================
@@ -55,7 +55,7 @@ psycopg2-binary==2.9.9     # Driver PostgreSQL (binário, produção)
 # =============================
 # Telegram Bot (BotGestor)
 # =============================
-aiogram==2.25.2            # Framework para Telegram Bot (estável)
+aiogram==2.25.2            # Framework Telegram (requer aiohttp <3.9.0)
 
 # =============================
 # Extras / Typing

@@ -1,70 +1,65 @@
 # =============================
-# Dockerfile — Bridge + BotGestor com supervisord + GeoIP (sem Docker Hub)
+# Dockerfile — Bridge + BotGestor + GeoIP + supervisord
+# Base: Debian 12 (bookworm) com Python 3.11 via apt
 # =============================
-FROM gcr.io/google-appengine/python
+FROM debian:bookworm-slim
 
 # -----------------------------
-# 1) Variáveis globais
+# Variáveis globais
 # -----------------------------
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PORT=8080 \
     PATH="/usr/local/bin:$PATH" \
-    GEOIP_PATH="/app/GeoLite2-City.mmdb"
+    GEOIP_PATH="/app/GeoLite2-City.mmdb" \
+    PYTHONPATH="/app"
 
 WORKDIR /app
 
 # -----------------------------
-# 2) Instala pacotes básicos do sistema
+# 1) Sistema + Python 3.11 + build deps
 # -----------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    g++ \
-    make \
-    libpq-dev \
-    curl \
-    unzip \
+    python3 python3-venv python3-dev python3-pip \
+    gcc g++ make libpq-dev \
+    curl unzip ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # -----------------------------
-# 3) Instala dependências do Bridge
+# 2) Instalar dependências do Bridge
 # -----------------------------
 COPY requirements-bridge.txt ./requirements-bridge.txt
-RUN pip install --no-cache-dir -r requirements-bridge.txt
+RUN pip3 install --break-system-packages --no-cache-dir -r requirements-bridge.txt
 
 # -----------------------------
-# 4) Instala dependências do BotGestor
+# 3) Instalar dependências do BotGestor
 # -----------------------------
 COPY bot_gesto/requirements.txt ./requirements-bot.txt
-RUN pip install --no-cache-dir -r requirements-bot.txt
+RUN pip3 install --break-system-packages --no-cache-dir -r requirements-bot.txt
 
 # -----------------------------
-# 5) Instala supervisord
+# 4) Supervisord (via pip)
 # -----------------------------
-RUN pip install --no-cache-dir supervisor
+RUN pip3 install --break-system-packages --no-cache-dir supervisor
 
 # -----------------------------
-# 6) Copia todo o código (Bridge + BotGestor + configs)
+# 5) Copiar código
 # -----------------------------
 COPY . .
 
 # -----------------------------
-# 7) Baixa banco GeoLite2 (GeoIP2)
+# 6) Baixar GeoLite2 City (GeoIP) - direto, sem tar
 # -----------------------------
-RUN curl -L -o GeoLite2-City.mmdb.tar.gz \
-    https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-City.mmdb.tar.gz \
-    && tar -xvzf GeoLite2-City.mmdb.tar.gz --strip-components=1 -C /app \
-    && rm GeoLite2-City.mmdb.tar.gz
+RUN curl -L -o /app/GeoLite2-City.mmdb \
+    https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-City.mmdb
 
 # -----------------------------
-# 8) Expõe portas necessárias
+# 7) Expor portas
 # -----------------------------
-# Bridge
 EXPOSE 8080
-# Admin
 EXPOSE 8000
 
 # -----------------------------
-# 9) Supervisord como entrypoint
+# 8) Entrypoint
 # -----------------------------
 CMD ["supervisord", "-c", "/app/supervisord.conf"]
