@@ -1,5 +1,5 @@
 # =============================
-# app_bridge.py — v3.1 (Typebot-ready, enriquecimento e compat com bot_gesto)
+# app_bridge.py — v3.2 (Bridge com enriquecimento + logs claros)
 # =============================
 import os, sys, json, time, secrets, logging, asyncio, base64, hashlib, importlib.util
 from typing import Optional, Dict, Any, List, Tuple
@@ -8,9 +8,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from redis import Redis
 from cryptography.fernet import Fernet
-from fastapi.responses import RedirectResponse  # (NOVO) para redirecionar no /apply
+from fastapi.responses import RedirectResponse
 
-# ====== Logging JSON ======
+# =============================
+# Logging JSON estruturado
+# =============================
 class JSONFormatter(logging.Formatter):
     def format(self, record):
         log = {
@@ -29,11 +31,13 @@ _ch = logging.StreamHandler()
 _ch.setFormatter(JSONFormatter())
 logger.addHandler(_ch)
 
-# ====== Descoberta dinâmica do bot_gesto ======
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # /app
+# =============================
+# Descoberta dinâmica do bot_gesto
+# =============================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
 CWD_DIR = os.getcwd()
-ENV_DIR = os.getenv("BRIDGE_BOT_DIR")  # ex.: /app/bot_gesto
+ENV_DIR = os.getenv("BRIDGE_BOT_DIR")
 
 def _ls(path: Optional[str]) -> Dict[str, Any]:
     try:
@@ -42,8 +46,7 @@ def _ls(path: Optional[str]) -> Dict[str, Any]:
         entries = []
         for name in sorted(os.listdir(path))[:80]:
             p = os.path.join(path, name)
-            flag = "d" if os.path.isdir(p) else "f"
-            entries.append(f"{flag}:{name}")
+            entries.append(("d" if os.path.isdir(p) else "f") + ":" + name)
         return {"path": path, "exists": os.path.isdir(path), "entries": entries}
     except Exception as e:
         return {"path": path, "exists": False, "error": str(e)}
@@ -59,7 +62,7 @@ def _import_from_file(modname: str, filepath: str):
     if not spec or not spec.loader:
         raise ImportError(f"spec loader inválido para {filepath}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # type: ignore[attr-defined]
+    spec.loader.exec_module(module)  # type: ignore
     return module
 
 def _is_bot_dir(d: str) -> bool:
@@ -110,10 +113,10 @@ for p in [BASE_DIR, PARENT_DIR]:
 save_lead = None
 send_event_to_all = None
 
-# 1) Import como pacote
+# Import como pacote
 try:
-    import bot_gesto.db as _db1  # type: ignore
-    import bot_gesto.fb_google as _fb1  # type: ignore
+    import bot_gesto.db as _db1
+    import bot_gesto.fb_google as _fb1
     save_lead = getattr(_db1, "save_lead")
     send_event_to_all = getattr(_fb1, "send_event_to_all")
     IMPORT_INFO.update({
@@ -125,11 +128,11 @@ try:
 except Exception as e1:
     IMPORT_INFO["errors"].append(f"pkg bot_gesto: {e1}")
 
-# 2) Import como pacote alternativo (compat)
+# Import alternativo
 if save_lead is None or send_event_to_all is None:
     try:
-        import typebot_conection.bot_gesto.db as _db2  # type: ignore
-        import typebot_conection.bot_gesto.fb_google as _fb2  # type: ignore
+        import typebot_conection.bot_gesto.db as _db2
+        import typebot_conection.bot_gesto.fb_google as _fb2
         save_lead = getattr(_db2, "save_lead")
         send_event_to_all = getattr(_fb2, "send_event_to_all")
         IMPORT_INFO.update({
@@ -141,7 +144,7 @@ if save_lead is None or send_event_to_all is None:
     except Exception as e2:
         IMPORT_INFO["errors"].append(f"pkg typebot_conection.bot_gesto: {e2}")
 
-# 3) Import por caminho
+# Import por caminho
 if save_lead is None or send_event_to_all is None:
     candidates = [
         ENV_DIR,
@@ -179,7 +182,7 @@ if save_lead is None or send_event_to_all is None:
                 IMPORT_INFO["errors"].append(f"file import: {e3}")
         else:
             IMPORT_INFO["errors"].append(
-                f"arquivos não encontrados em {chosen} (esperado db.py e fb_google.py)"
+                f"arquivos não encontrados em {chosen}"
             )
     else:
         IMPORT_INFO["errors"].append("nenhuma pasta candidata com db.py e fb_google.py foi encontrada")
@@ -188,14 +191,14 @@ if save_lead is None or send_event_to_all is None:
     logger.error(json.dumps({
         "event": "IMPORT_FAIL",
         **IMPORT_INFO,
-        "hint": "Garanta que bot_gesto/** está dentro do container e NÃO está ignorado no .dockerignore.",
-        "ls_chosen": _ls(IMPORT_INFO.get("chosen_dir")),
     }))
     raise RuntimeError("❌ Não foi possível localizar 'save_lead' e 'send_event_to_all'.")
 
-logger.info(json.dumps({"event": "IMPORT_OK", **{k: v for k, v in IMPORT_INFO.items() if k != "errors"}}))
+logger.info(json.dumps({"event": "IMPORT_OK", **{k: v for k, v in IMPORT_INFO.items() if k != 'errors'}}))
 
-# ====== ENV do Bridge ======
+# =============================
+# ENV Bridge
+# =============================
 REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 BOT_USERNAME    = os.getenv("BOT_USERNAME", "").lstrip("@")
 TOKEN_TTL_SEC   = int(os.getenv("TOKEN_TTL_SEC", "3600"))
@@ -204,11 +207,10 @@ BRIDGE_TOKEN    = os.getenv("BRIDGE_TOKEN", "")
 ALLOWED_ORIGINS = [o.strip() for o in (os.getenv("ALLOWED_ORIGINS", "") or "").split(",") if o.strip()]
 PORT            = int(os.getenv("PORT", "8080"))
 
-# Enriquecimento opcional
-GEOIP_DB_PATH   = os.getenv("GEOIP_DB_PATH", "")  # ex.: /app/GeoLite2-City.mmdb
+GEOIP_DB_PATH   = os.getenv("GEOIP_DB_PATH", "")
 USE_USER_AGENTS = os.getenv("USE_USER_AGENTS", "1") == "1"
 
-# Crypto opcional
+# Crypto
 CRYPTO_KEY = os.getenv("CRYPTO_KEY")
 fernet = None
 if CRYPTO_KEY:
@@ -216,7 +218,6 @@ if CRYPTO_KEY:
     fernet = Fernet(derived)
     logger.info("✅ Cripto: Fernet habilitado")
 
-# Log não-sensível de config (sem vazar tokens)
 def _mask(v: str) -> str:
     if not v:
         return ""
@@ -235,15 +236,17 @@ logger.info(json.dumps({
 }))
 
 if not BOT_USERNAME:
-    raise RuntimeError("BOT_USERNAME não configurado (ex.: SeuBotUsername)")
+    raise RuntimeError("BOT_USERNAME não configurado")
 
 redis = Redis.from_url(REDIS_URL, decode_responses=True)
 
-# ====== GeoIP (opcional) ======
+# =============================
+# GeoIP
+# =============================
 _geo_reader = None
 if GEOIP_DB_PATH and os.path.exists(GEOIP_DB_PATH):
     try:
-        import geoip2.database  # opcional
+        import geoip2.database
         _geo_reader = geoip2.database.Reader(GEOIP_DB_PATH)
         logger.info("🌎 GeoIP habilitado")
     except Exception as e:
@@ -257,10 +260,10 @@ def geo_lookup(ip: str) -> Dict[str, Any]:
         r = _geo_reader.city(ip)
         out = {
             "ip": ip,
-            "country": (r.country and r.country.iso_code) or None,
-            "country_name": (r.country and r.country.name) or None,
-            "region": (r.subdivisions and r.subdivisions[0].name) if r.subdivisions else None,
-            "city": (r.city and r.city.name) or None,
+            "country": r.country.iso_code if r.country else None,
+            "country_name": r.country.name if r.country else None,
+            "region": r.subdivisions[0].name if r.subdivisions else None,
+            "city": r.city.name if r.city else None,
             "lat": r.location.latitude if r.location else None,
             "lon": r.location.longitude if r.location else None,
             "timezone": r.location.time_zone if r.location else None,
@@ -269,13 +272,12 @@ def geo_lookup(ip: str) -> Dict[str, Any]:
         pass
     return out
 
-# ====== UA parse (opcional) ======
 def parse_ua(ua: Optional[str]) -> Dict[str, Any]:
     if not ua:
         return {}
     if USE_USER_AGENTS:
         try:
-            from user_agents import parse as ua_parse  # opcional
+            from user_agents import parse as ua_parse
             u = ua_parse(ua)
             return {
                 "ua": ua,
@@ -287,8 +289,10 @@ def parse_ua(ua: Optional[str]) -> Dict[str, Any]:
             return {"ua": ua}
     return {"ua": ua}
 
-# ====== App & CORS ======
-app = FastAPI(title="Typebot Bridge", version="3.1.0")
+# =============================
+# App FastAPI
+# =============================
+app = FastAPI(title="Typebot Bridge", version="3.2")
 if ALLOWED_ORIGINS:
     app.add_middleware(
         CORSMiddleware,
@@ -298,7 +302,9 @@ if ALLOWED_ORIGINS:
         allow_headers=["*"],
     )
 
-# ====== Schemas ======
+# =============================
+# Schemas
+# =============================
 class TBPayload(BaseModel):
     _fbp: Optional[str] = None
     _fbc: Optional[str] = None
@@ -334,7 +340,9 @@ class TBPayload(BaseModel):
     class Config:
         populate_by_name = True
 
-# ====== Helpers ======
+# =============================
+# Helpers
+# =============================
 def _make_token(n: int = 16) -> str:
     return secrets.token_urlsafe(n)
 
@@ -369,11 +377,6 @@ def _auth_guard(
         logger.warning(json.dumps({
             "event": "AUTH_FAIL",
             "reason": "token_mismatch",
-            "got_headers": {
-                "has_x_api_key": bool(x_api_key),
-                "has_x_bridge_token": bool(x_bridge_token),
-                "has_authorization_bearer": bool(bearer),
-            }
         }))
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -425,7 +428,6 @@ def _enrich_payload(data: dict, req: Request) -> dict:
         elif ck.get("cid_hint"):
             data["cid"] = ck["cid_hint"]
 
-    # (CORRIGIDO) tudo dentro do if ip:
     if ip:
         data.setdefault("ip", ip)
         geo = geo_lookup(ip)
@@ -445,7 +447,6 @@ def _enrich_payload(data: dict, req: Request) -> dict:
 
     data.setdefault("ts", int(time.time()))
 
-    # criptografia opcional do blob
     if fernet:
         try:
             raw = json.dumps(data).encode()
@@ -453,16 +454,27 @@ def _enrich_payload(data: dict, req: Request) -> dict:
         except Exception as e:
             logger.warning(f"⚠️ Encryption failed: {e}")
 
+    # LOG DO ENRIQUECIMENTO
+    logger.info(json.dumps({
+        "event": "ENRICH_OK",
+        "ip": data.get("ip"),
+        "geo": data.get("geo"),
+        "device": data.get("device"),
+        "os": data.get("os"),
+        "browser": data.get("browser"),
+    }))
+
     return data
 
 async def _maybe_async(fn, *args, **kwargs):
-    """Executa função sync/async de forma transparente."""
     res = fn(*args, **kwargs)
     if asyncio.iscoroutine(res):
         return await res
     return res
 
-# ====== Rotas ======
+# =============================
+# Rotas
+# =============================
 @app.get("/health")
 def health():
     try:
@@ -476,12 +488,10 @@ def health():
         "ls_chosen": _ls(IMPORT_INFO.get("chosen_dir")),
     }
 
-# Anti-405 para browsers e edge proxies (CORS preflight)
 @app.options("/{full_path:path}")
 async def options_ok(full_path: str):
     return {}
 
-# 1) Deep link flow (opcional)
 @app.post("/tb/link")
 async def create_deeplink(
     req: Request,
@@ -520,7 +530,6 @@ def delete_token(
     redis.delete(_key(token))
     return {"deleted": True, "token": token}
 
-# 2) Endpoint universal para Typebot (INGEST)
 @app.post("/event")
 async def ingest_event(
     req: Request,
@@ -530,24 +539,20 @@ async def ingest_event(
     authorization: Optional[str] = Header(default=None),
     event_type: Optional[str] = "Lead"
 ):
-    """
-    Recebe o JSON do Typebot e:
-    - enriquece (ip/geo/ua/cookies)
-    - salva no DB (save_lead)
-    - dispara pixels (send_event_to_all) com o event_type (default=Lead)
-    """
-    # aceita BRIDGE_API_KEY (X-Api-Key), X-Bridge-Token e Authorization: Bearer
     _auth_guard(x_api_key, x_bridge_token, authorization)
-
     data = _enrich_payload(body.dict(by_alias=True, exclude_none=True), req)
 
-    # salva e envia (compat sync/async)
     asyncio.create_task(_maybe_async(save_lead, data))
     asyncio.create_task(_maybe_async(send_event_to_all, data, et=event_type or "Lead"))
 
+    logger.info(json.dumps({
+        "event": "EVENT_SENT",
+        "type": event_type or "Lead",
+        "telegram_id": data.get("telegram_id"),
+    }))
+
     return {"status": "ok", "saved": True, "events": [event_type or "Lead"]}
 
-# (alias compatível, caso você já tenha apontado o Typebot pra /webhook)
 @app.post("/webhook")
 async def webhook(
     req: Request,
@@ -556,7 +561,6 @@ async def webhook(
     authorization: Optional[str] = Header(default=None),
     x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
 ):
-    # Reusa a mesma guarda e pipeline do /event, mantendo compat e lógica intacta
     return await ingest_event(
         req=req,
         body=body,
@@ -566,7 +570,6 @@ async def webhook(
         event_type="Lead",
     )
 
-# (NOVO) alias compatível para Typebot -> /bridge
 @app.post("/bridge")
 async def bridge(
     req: Request,
@@ -575,10 +578,6 @@ async def bridge(
     authorization: Optional[str] = Header(default=None),
     x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
 ):
-    """
-    Alias de /event, criado para compatibilidade direta com Typebot.
-    Permite que o Typebot poste em /bridge sem retornar erro 405.
-    """
     return await ingest_event(
         req=req,
         body=body,
@@ -588,20 +587,9 @@ async def bridge(
         event_type="Lead",
     )
 
-# (NOVO) endpoint fixo para o Bot A entregar — gera link dinâmico e redireciona
 @app.get("/apply")
-async def apply_redirect(
-    req: Request,
-):
-    """
-    Entregável fixo para o Bot A (público).
-    - Gera um token dinâmico
-    - Armazena payload mínimo (enriquecido com headers/cookies e querystring)
-    - Redireciona para o deep link do Bot B
-    """
-    # Sem _auth_guard aqui para evitar "Unauthorized" em cliques do usuário final
+async def apply_redirect(req: Request):
     base_payload: Dict[str, Any] = {"source": "apply"}
-    # inclui querystring (opcional)
     try:
         if req.query_params:
             base_payload["qs"] = dict(req.query_params)
@@ -611,4 +599,12 @@ async def apply_redirect(
     data = _enrich_payload(base_payload, req)
     token = _make_token()
     redis.setex(_key(token), TOKEN_TTL_SEC, json.dumps(data))
+
+    logger.info(json.dumps({
+        "event": "APPLY_REDIRECT",
+        "token": token,
+        "ip": data.get("ip"),
+        "geo": data.get("geo")
+    }))
+
     return RedirectResponse(url=_deep_link(token))
