@@ -1,4 +1,4 @@
-# bot.py — versão 2.4 com Invite Link em mensagem separada + atualização de enriquecimento/sincronia
+# bot.py — v3.0 (Padrão A: envio direto, sem fila) — alinhado a fb_google v3.0
 import os, logging, json, asyncio, time
 from datetime import datetime
 from typing import Dict, Any, Optional
@@ -12,7 +12,7 @@ from prometheus_client import Counter, Histogram
 # DB / Pixels
 # =============================
 from bot_gesto.db import save_lead, init_db, sync_pending_leads
-from bot_gesto.fb_google import enqueue_event, process_event_queue, send_event_to_all
+from bot_gesto.fb_google import send_event_with_retry  # <- envio direto, sem fila
 from bot_gesto.utils import now_ts
 
 # =============================
@@ -45,12 +45,11 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 SYNC_INTERVAL_SEC = int(os.getenv("SYNC_INTERVAL_SEC", "60"))
 BRIDGE_NS = os.getenv("BRIDGE_NS", "typebot")
 
+# opcional: para construir fallback de URL de origem
+VIP_PUBLIC_USERNAME = (os.getenv("VIP_PUBLIC_USERNAME") or "").strip().lstrip("@")
+
 SECRET_KEY = os.getenv("SECRET_KEY", Fernet.generate_key().decode())
 fernet = Fernet(SECRET_KEY.encode() if isinstance(SECRET_KEY, str) else SECRET_KEY)
-
-# Preview vars
-VIP_PUBLIC_USERNAME = (os.getenv("VIP_PUBLIC_USERNAME") or "").strip().lstrip("@")
-VIP_PREVIEW_IMAGE_URL = (os.getenv("VIP_PREVIEW_IMAGE_URL") or "").strip()
 
 if not BOT_TOKEN or not VIP_CHANNEL:
     raise RuntimeError("BOT_TOKEN e VIP_CHANNEL são obrigatórios")
@@ -65,8 +64,7 @@ init_db()
 # =============================
 # Métricas Prometheus
 # =============================
-LEADS_SENT = Counter('bot_leads_sent_total', 'Total de leads enviados')
-EVENT_RETRIES = Counter('bot_event_retries_total', 'Retries em eventos')
+LEADS_TRIGGERED = Counter('bot_leads_triggered_total', 'Leads disparados (envio direto)')
 PROCESS_LATENCY = Histogram('bot_process_latency_seconds', 'Latência no processamento')
 VIP_LINK_ERRORS = Counter('bot_vip_link_errors_total', 'Falhas ao gerar link VIP')
 
@@ -103,18 +101,20 @@ def parse_start_args(msg: types.Message) -> Dict[str, Any]:
             return {}
         raw = raw.strip()
 
+        # deep-link do Bridge: t_<token>
         if raw.startswith("t_"):
             token = raw[2:]
             blob = redis_client.get(f"{BRIDGE_NS}:{token}")
             if blob:
                 try:
                     data = json.loads(blob)
-                    redis_client.delete(f"{BRIDGE_NS}:{token}")
+                    redis_client.delete(f"{BRIDGE_NS}:{token}")  # one-shot
                     return data
                 except Exception:
                     return {}
             return {}
 
+        # json inline (fallback)
         if raw.startswith("{") and raw.endswith("}"):
             return json.loads(raw)
 
@@ -129,8 +129,22 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
     user_id = user.id
     now = int(time.time())
 
+    # Sinais FB (mantém os do Bridge quando vierem)
     fbp = args.get("_fbp") or f"fb.1.{now}.{user_id}"
     fbc = args.get("_fbc") or (f"fb.1.{now}.fbclid.{user_id}" if args.get("fbclid") else f"fbc-{user_id}-{now}")
+
+    # NÃO inventar IP: se o Bridge não trouxe IP real, deixamos ausente
+    ip_from_bridge = args.get("ip")
+    ua_from_bridge = args.get("user_agent")
+
+    # fonte do evento (para CAPI/GA4)
+    event_source_url = (
+        args.get("event_source_url")
+        or args.get("landing_url")
+        or (f"https://t.me/{VIP_PUBLIC_USERNAME}" if VIP_PUBLIC_USERNAME else None)
+    )
+
+    # cookies (opcional, útil para auditoria interna)
     cookies = {"_fbp": encrypt_data(fbp), "_fbc": encrypt_data(fbc)}
 
     device_info = {
@@ -138,10 +152,12 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         "app": "aiogram",
         "device": args.get("device"),
         "os": args.get("os"),
-        "url": args.get("landing_url") or args.get("event_source_url"),
+        "browser": args.get("browser"),
+        "url": event_source_url,
     }
 
     lead: Dict[str, Any] = {
+        # chaves principais
         "telegram_id": user_id,
         "username": user.username or "",
         "first_name": user.first_name or "",
@@ -149,16 +165,20 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         "premium": getattr(user, "is_premium", False),
         "lang": user.language_code or "",
         "origin": "telegram",
-        "user_agent": args.get("user_agent") or "TelegramBot/1.0",
-        "ip_address": args.get("ip") or f"192.168.{user_id % 256}.{(user_id // 256) % 256}",
 
-        "event_key": f"tg-{user_id}-{now}",
+        # sinais técnicos
+        "user_agent": ua_from_bridge or "TelegramBot/1.0",
+        "ip": ip_from_bridge,  # usado por utils.normalize_user_data
+        "event_source_url": event_source_url,
         "event_time": now_ts(),
+        "event_key": f"tg-{user_id}-{now}",
 
+        # enrichment auxiliar
         "cookies": cookies,
         "device_info": device_info,
         "session_metadata": {"msg_id": msg.message_id, "chat_id": msg.chat.id},
 
+        # UTM e clids (mantém enrichment do Bridge)
         "utm_source": args.get("utm_source") or "telegram",
         "utm_medium": args.get("utm_medium") or "botb",
         "utm_campaign": args.get("utm_campaign") or "vip_access",
@@ -174,6 +194,14 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         "value": args.get("value") or 0,
         "currency": args.get("currency") or "BRL",
 
+        # Geo (pode vir do Bridge)
+        "country": args.get("country"),
+        "city": args.get("city"),
+        "state": args.get("state"),
+
+        # espelha sinais para utils/FB CAPI (hashing)
+        "_fbp": fbp,
+        "_fbc": fbc,
         "user_data": {
             "email": args.get("email"),
             "phone": args.get("phone"),
@@ -187,35 +215,11 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
             "external_id": str(user_id),
             "fbp": fbp,
             "fbc": fbc,
-            "ip": args.get("ip"),
-            "ua": args.get("user_agent"),
+            "ip": ip_from_bridge,
+            "ua": ua_from_bridge,
         }
     }
     return lead
-
-# =============================
-# Envio de eventos com retry
-# =============================
-async def send_event_with_retry(event_type: str, lead: Dict[str, Any], retries: int = 5, base_delay: float = 1.5) -> bool:
-    attempt = 0
-    while attempt < retries:
-        try:
-            res = await send_event_to_all(lead, et=event_type)
-            ok_fb = bool(isinstance(res.get("facebook"), dict) and res["facebook"].get("ok"))
-            ok_ga = "google" not in res or bool(res.get("google", {}).get("ok") or res.get("google", {}).get("skip"))
-            if ok_fb and ok_ga:
-                LEADS_SENT.inc()
-                logger.info(json.dumps({"event": "EVENT_SENT", "type": event_type, "telegram_id": lead.get("telegram_id")}))
-                return True
-            else:
-                raise RuntimeError(f"send_event_to_all failed: {res}")
-        except Exception as e:
-            attempt += 1
-            EVENT_RETRIES.inc()
-            logger.warning(json.dumps({"event": "EVENT_RETRY", "type": event_type, "attempt": attempt, "error": str(e)}))
-            await asyncio.sleep((base_delay ** attempt) + 0.2 * attempt)
-    logger.error(json.dumps({"event": "EVENT_FAILED", "type": event_type, "telegram_id": lead.get("telegram_id")}))
-    return False
 
 # =============================
 # Preview helper (invite sozinho)
@@ -230,24 +234,31 @@ async def send_vip_message_with_preview(msg: types.Message, first_name: str, vip
         await msg.answer(f"🔑 Acesse aqui: {vip_link}", disable_web_page_preview=False)
 
 # =============================
-# Processamento de novo lead
+# Processamento de novo lead (envio direto)
 # =============================
 async def process_new_lead(msg: types.Message):
+    start_t = time.perf_counter()
     args = parse_start_args(msg)
     lead = build_lead(msg.from_user, msg, args)
 
+    # persiste no DB
     await save_lead(lead)
+
+    # gera link VIP (não bloqueia envio do evento)
     vip_link = await generate_vip_link(lead["event_key"])
 
-    try:
-        # mantém lógica: envia Lead e Subscribe juntos
-        await enqueue_event("Lead", {"event_key": lead["event_key"], "telegram_id": lead["telegram_id"]})
-        await enqueue_event("Subscribe", {"event_key": lead["event_key"], "telegram_id": lead["telegram_id"]})
-    except Exception as e:
-        logger.warning(json.dumps({"event": "QUEUE_ENQ_FAIL", "error": str(e)}))
-
+    # dispara o evento de forma assíncrona (Lead apenas)
+    # Subscribe automático acontecerá DENTRO do fb_google, se FB_AUTO_SUBSCRIBE_FROM_LEAD=1
     asyncio.create_task(send_event_with_retry("Lead", lead))
-    asyncio.create_task(send_event_with_retry("Subscribe", lead))
+    LEADS_TRIGGERED.inc()
+
+    PROCESS_LATENCY.observe(time.perf_counter() - start_t)
+    logger.info(json.dumps({
+        "event": "EVENT_TRIGGERED",
+        "dispatch_path": "direct",
+        "type": "Lead",
+        "telegram_id": lead.get("telegram_id")
+    }))
 
     return vip_link, lead
 
@@ -272,7 +283,7 @@ async def fallback(msg: types.Message):
     await msg.answer("Use /start para iniciar o fluxo de acesso VIP.")
 
 # =============================
-# Loops de background
+# Loop de sincronização pendentes (DB)
 # =============================
 async def _sync_pending_loop():
     while True:
@@ -284,21 +295,12 @@ async def _sync_pending_loop():
             logger.error(json.dumps({"event": "SYNC_PENDING_ERROR", "error": str(e)}))
         await asyncio.sleep(SYNC_INTERVAL_SEC)
 
-async def _event_queue_loop():
-    while True:
-        try:
-            await process_event_queue()
-        except Exception as e:
-            logger.error(json.dumps({"event": "QUEUE_LOOP_ERROR", "error": str(e)}))
-        await asyncio.sleep(1)
-
 # =============================
 # Runner
 # =============================
 if __name__ == "__main__":
     async def main():
-        logger.info(json.dumps({"event": "BOT_START"}))
+        logger.info(json.dumps({"event": "BOT_START", "dispatch_path": "direct"}))
         asyncio.create_task(_sync_pending_loop())
-        asyncio.create_task(_event_queue_loop())
         await dp.start_polling()
     asyncio.run(main())
