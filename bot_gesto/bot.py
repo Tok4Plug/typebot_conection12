@@ -1,7 +1,14 @@
-# bot.py — v3.0 (Padrão A: envio direto, sem fila) — alinhado a fb_google v3.0
-import os, logging, json, asyncio, time
+# bot.py — v3.2 (Padrão A: envio direto, sem fila; enriquecimento completo + dedupe estável)
+# - Parser robusto de /start: t_<token> (Redis), JSON inline, Base64URL (b64:), query "k=v&..."
+# - Enriquecimento: fbc a partir de fbclid, login_id, click_id, zip/cep, external_id
+# - event_id já calculado (estável) para manter dedupe consistente em toda a stack
+# - Sem IP/UA inventados (usa apenas os reais do bridge quando existirem)
+# - Logs estruturados + métricas Prometheus
+
+import os, logging, json, asyncio, time, base64
 from datetime import datetime
 from typing import Dict, Any, Optional
+from urllib.parse import parse_qsl
 
 from aiogram import Bot, Dispatcher, types
 import redis
@@ -9,11 +16,11 @@ from cryptography.fernet import Fernet
 from prometheus_client import Counter, Histogram
 
 # =============================
-# DB / Pixels
+# DB / Pixels / Utils
 # =============================
 from bot_gesto.db import save_lead, init_db, sync_pending_leads
-from bot_gesto.fb_google import send_event_with_retry  # <- envio direto, sem fila
-from bot_gesto.utils import now_ts
+from bot_gesto.fb_google import send_event_with_retry  # envio direto, sem fila
+from bot_gesto.utils import now_ts, clamp_event_time, build_event_id
 
 # =============================
 # Logging estruturado (JSON)
@@ -28,7 +35,7 @@ class JSONFormatter(logging.Formatter):
         }
         if record.exc_info:
             log["exc_info"] = self.formatException(record.exc_info)
-        return json.dumps(log)
+        return json.dumps(log, ensure_ascii=False)
 
 logger = logging.getLogger("bot")
 logger.setLevel(logging.INFO)
@@ -40,13 +47,14 @@ logger.addHandler(ch)
 # ENV
 # =============================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-VIP_CHANNEL = os.getenv("VIP_CHANNEL")  # chat_id do canal VIP
+VIP_CHANNEL = os.getenv("VIP_CHANNEL")  # chat_id do canal VIP (numérico)
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 SYNC_INTERVAL_SEC = int(os.getenv("SYNC_INTERVAL_SEC", "60"))
 BRIDGE_NS = os.getenv("BRIDGE_NS", "typebot")
-
-# opcional: para construir fallback de URL de origem
 VIP_PUBLIC_USERNAME = (os.getenv("VIP_PUBLIC_USERNAME") or "").strip().lstrip("@")
+
+# Anti-duplicidade leve no /start (opcional)
+LEAD_THROTTLE_SEC = int(os.getenv("LEAD_THROTTLE_SEC", "0"))  # 0 = desliga
 
 SECRET_KEY = os.getenv("SECRET_KEY", Fernet.generate_key().decode())
 fernet = Fernet(SECRET_KEY.encode() if isinstance(SECRET_KEY, str) else SECRET_KEY)
@@ -67,6 +75,7 @@ init_db()
 LEADS_TRIGGERED = Counter('bot_leads_triggered_total', 'Leads disparados (envio direto)')
 PROCESS_LATENCY = Histogram('bot_process_latency_seconds', 'Latência no processamento')
 VIP_LINK_ERRORS = Counter('bot_vip_link_errors_total', 'Falhas ao gerar link VIP')
+START_THROTTLED = Counter('bot_start_throttled_total', 'Mensagens /start ignoradas por throttle')
 
 # =============================
 # Segurança
@@ -94,6 +103,35 @@ async def generate_vip_link(event_key: str, member_limit=1, expire_hours=24) -> 
 # =============================
 # Parser de argumentos do /start
 # =============================
+def _try_parse_json(s: str) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+def _try_parse_b64url(s: str) -> Optional[Dict[str, Any]]:
+    """
+    Aceita 'b64:<payload>' ou diretamente um blob base64url.
+    """
+    raw = s[4:] if s.startswith("b64:") else s
+    # normaliza padding
+    padding = '=' * (-len(raw) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(raw + padding).decode()
+        return _try_parse_json(decoded) or dict(parse_qsl(decoded))
+    except Exception:
+        return None
+
+def _try_parse_kv(s: str) -> Optional[Dict[str, Any]]:
+    """
+    Aceita formato 'k=v&x=y'. Não suporta nested; bom como fallback.
+    """
+    try:
+        pairs = dict(parse_qsl(s, keep_blank_values=False))
+        return pairs or None
+    except Exception:
+        return None
+
 def parse_start_args(msg: types.Message) -> Dict[str, Any]:
     try:
         raw = msg.get_args() if hasattr(msg, "get_args") else None
@@ -109,14 +147,26 @@ def parse_start_args(msg: types.Message) -> Dict[str, Any]:
                 try:
                     data = json.loads(blob)
                     redis_client.delete(f"{BRIDGE_NS}:{token}")  # one-shot
-                    return data
+                    return data or {}
                 except Exception:
                     return {}
             return {}
 
-        # json inline (fallback)
+        # JSON inline
         if raw.startswith("{") and raw.endswith("}"):
-            return json.loads(raw)
+            parsed = _try_parse_json(raw)
+            if parsed is not None:
+                return parsed
+
+        # Base64URL (b64: ou direto)
+        b64_parsed = _try_parse_b64url(raw)
+        if b64_parsed is not None:
+            return b64_parsed
+
+        # k=v&x=y
+        kv = _try_parse_kv(raw)
+        if kv is not None:
+            return kv
 
     except Exception:
         pass
@@ -129,15 +179,20 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
     user_id = user.id
     now = int(time.time())
 
-    # Sinais FB (mantém os do Bridge quando vierem)
+    # Sinais FB (prioriza do Bridge)
+    fbclid = args.get("fbclid")
     fbp = args.get("_fbp") or f"fb.1.{now}.{user_id}"
-    fbc = args.get("_fbc") or (f"fb.1.{now}.fbclid.{user_id}" if args.get("fbclid") else f"fbc-{user_id}-{now}")
+    # fbc oficial quando há fbclid: fb.1.<ts>.<fbclid>
+    fbc = (
+        args.get("_fbc")
+        or (f"fb.1.{now}.{fbclid}" if fbclid else f"fb.1.{now}.tg.{user_id}")
+    )
 
-    # NÃO inventar IP: se o Bridge não trouxe IP real, deixamos ausente
+    # Não inventar IP/UA
     ip_from_bridge = args.get("ip")
     ua_from_bridge = args.get("user_agent")
 
-    # fonte do evento (para CAPI/GA4)
+    # Fonte do evento
     event_source_url = (
         args.get("event_source_url")
         or args.get("landing_url")
@@ -146,6 +201,22 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
 
     # cookies (opcional, útil para auditoria interna)
     cookies = {"_fbp": encrypt_data(fbp), "_fbc": encrypt_data(fbc)}
+
+    # Mapeia CEP/ZIP
+    zip_code = args.get("zip") or args.get("postal_code") or args.get("cep")
+
+    # click_id (útil para dedupe e troubleshooting)
+    click_id = (
+        args.get("click_id")
+        or args.get("gclid")
+        or args.get("wbraid")
+        or args.get("gbraid")
+        or fbclid
+    )
+
+    # login_id / external_id (identidade de login no ecossistema)
+    login_id = args.get("login_id") or str(user_id)
+    external_id = args.get("external_id") or str(user_id)
 
     device_info = {
         "platform": "telegram",
@@ -156,29 +227,33 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         "url": event_source_url,
     }
 
+    # Monta lead base
     lead: Dict[str, Any] = {
         # chaves principais
         "telegram_id": user_id,
+        "external_id": external_id,
         "username": user.username or "",
         "first_name": user.first_name or "",
         "last_name": user.last_name or "",
         "premium": getattr(user, "is_premium", False),
         "lang": user.language_code or "",
         "origin": "telegram",
+        "event_type": "Lead",
 
         # sinais técnicos
         "user_agent": ua_from_bridge or "TelegramBot/1.0",
-        "ip": ip_from_bridge,  # usado por utils.normalize_user_data
+        "ip": ip_from_bridge,
         "event_source_url": event_source_url,
         "event_time": now_ts(),
         "event_key": f"tg-{user_id}-{now}",
+        "click_id": click_id,
 
         # enrichment auxiliar
         "cookies": cookies,
         "device_info": device_info,
         "session_metadata": {"msg_id": msg.message_id, "chat_id": msg.chat.id},
 
-        # UTM e clids (mantém enrichment do Bridge)
+        # UTM e clids
         "utm_source": args.get("utm_source") or "telegram",
         "utm_medium": args.get("utm_medium") or "botb",
         "utm_campaign": args.get("utm_campaign") or "vip_access",
@@ -189,7 +264,7 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         "gbraid": args.get("gbraid"),
         "wbraid": args.get("wbraid"),
         "cid": args.get("cid"),
-        "fbclid": args.get("fbclid"),
+        "fbclid": fbclid,
 
         "value": args.get("value") or 0,
         "currency": args.get("currency") or "BRL",
@@ -209,16 +284,22 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
             "last_name": args.get("last_name") or user.last_name,
             "city": args.get("city"),
             "state": args.get("state"),
-            "zip": args.get("zip"),
+            "zip": zip_code,
             "country": args.get("country"),
             "telegram_id": str(user_id),
-            "external_id": str(user_id),
+            "external_id": external_id,
+            "login_id": login_id,     # auditoria/identidade
             "fbp": fbp,
             "fbc": fbc,
             "ip": ip_from_bridge,
             "ua": ua_from_bridge,
         }
     }
+
+    # event_id estável já no bot (mantém dedupe consistente na stack)
+    clamped = clamp_event_time(int(lead["event_time"]))
+    lead["event_id"] = build_event_id("Lead", lead, clamped)
+
     return lead
 
 # =============================
@@ -237,6 +318,16 @@ async def send_vip_message_with_preview(msg: types.Message, first_name: str, vip
 # Processamento de novo lead (envio direto)
 # =============================
 async def process_new_lead(msg: types.Message):
+    # throttle leve anti-flood (opcional)
+    if LEAD_THROTTLE_SEC > 0:
+        key = f"lead:throttle:{msg.from_user.id}"
+        if not redis_client.set(key, "1", nx=True, ex=LEAD_THROTTLE_SEC):
+            START_THROTTLED.inc()
+            logger.info(json.dumps({"event": "START_THROTTLED", "telegram_id": msg.from_user.id}))
+            # segue com retorno simples (não bloqueia fluxo do usuário)
+            await msg.answer("⏳ Um instante… já estamos processando seu acesso.")
+            # não retorna aqui; deixa continuar para garantir experiência
+
     start_t = time.perf_counter()
     args = parse_start_args(msg)
     lead = build_lead(msg.from_user, msg, args)

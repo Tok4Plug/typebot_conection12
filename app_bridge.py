@@ -1,11 +1,11 @@
 # =============================
-# app_bridge.py — v3.2 (Bridge com enriquecimento + logs claros)
+# app_bridge.py — v3.3 (Bridge com enriquecimento + login_id + logs claros)
 # =============================
 import os, sys, json, time, secrets, logging, asyncio, base64, hashlib, importlib.util
 from typing import Optional, Dict, Any, List, Tuple
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from redis import Redis
 from cryptography.fernet import Fernet
 from fastapi.responses import RedirectResponse
@@ -181,23 +181,18 @@ if save_lead is None or send_event_to_all is None:
             except Exception as e3:
                 IMPORT_INFO["errors"].append(f"file import: {e3}")
         else:
-            IMPORT_INFO["errors"].append(
-                f"arquivos não encontrados em {chosen}"
-            )
+            IMPORT_INFO["errors"].append(f"arquivos não encontrados em {chosen}")
     else:
         IMPORT_INFO["errors"].append("nenhuma pasta candidata com db.py e fb_google.py foi encontrada")
 
 if save_lead is None or send_event_to_all is None:
-    logger.error(json.dumps({
-        "event": "IMPORT_FAIL",
-        **IMPORT_INFO,
-    }))
+    logger.error(json.dumps({"event": "IMPORT_FAIL", **IMPORT_INFO}))
     raise RuntimeError("❌ Não foi possível localizar 'save_lead' e 'send_event_to_all'.")
 
 logger.info(json.dumps({"event": "IMPORT_OK", **{k: v for k, v in IMPORT_INFO.items() if k != 'errors'}}))
 
 # =============================
-# ENV Bridge
+# ENV Bridge (SEM novas ENVs)
 # =============================
 REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 BOT_USERNAME    = os.getenv("BOT_USERNAME", "").lstrip("@")
@@ -292,7 +287,7 @@ def parse_ua(ua: Optional[str]) -> Dict[str, Any]:
 # =============================
 # App FastAPI
 # =============================
-app = FastAPI(title="Typebot Bridge", version="3.2")
+app = FastAPI(title="Typebot Bridge", version="3.3")
 if ALLOWED_ORIGINS:
     app.add_middleware(
         CORSMiddleware,
@@ -303,9 +298,10 @@ if ALLOWED_ORIGINS:
     )
 
 # =============================
-# Schemas
+# Schemas (mantendo compat + extras úteis)
 # =============================
 class TBPayload(BaseModel):
+    # IDs/cookies/click-ids
     _fbp: Optional[str] = None
     _fbc: Optional[str] = None
     fbclid: Optional[str] = None
@@ -313,6 +309,8 @@ class TBPayload(BaseModel):
     gbraid: Optional[str] = None
     wbraid: Optional[str] = None
     cid: Optional[str] = None
+
+    # URLs/tráfego
     landing_url: Optional[str] = None
     event_source_url: Optional[str] = None
     utm_source: Optional[str] = None
@@ -320,9 +318,15 @@ class TBPayload(BaseModel):
     utm_campaign: Optional[str] = None
     utm_term: Optional[str] = None
     utm_content: Optional[str] = None
+
+    # Device/UA
     device: Optional[str] = None
     os: Optional[str] = None
-    user_agent: Optional[str] = Field(default=None, alias="user_agent")
+    user_agent: Optional[str] = None
+    browser: Optional[str] = None
+    platform: Optional[str] = None
+
+    # User fields
     email: Optional[str] = None
     phone: Optional[str] = None
     first_name: Optional[str] = None
@@ -331,14 +335,19 @@ class TBPayload(BaseModel):
     state: Optional[str] = None
     zip: Optional[str] = None
     country: Optional[str] = None
+
+    # Valores
     value: Optional[float] = None
     currency: Optional[str] = None
+
+    # IDs de usuário
     telegram_id: Optional[str] = None
+    external_id: Optional[str] = None
+    login_id: Optional[str] = None  # <- suporte a identificação de login
+
+    # Controle
     event: Optional[str] = None
     extra: Optional[Dict[str, Any]] = None
-
-    class Config:
-        populate_by_name = True
 
 # =============================
 # Helpers
@@ -398,6 +407,8 @@ def _parse_cookies(header_cookie: Optional[str]) -> Dict[str, Any]:
                 out[k.strip()] = v.strip()
     except Exception:
         pass
+
+    # Hints úteis
     ga = out.get("_ga")
     if ga and "GA" in ga and not out.get("cid"):
         try:
@@ -406,28 +417,76 @@ def _parse_cookies(header_cookie: Optional[str]) -> Dict[str, Any]:
                 out["cid_hint"] = f"{parts[-2]}.{parts[-1]}"
         except Exception:
             pass
+
+    # GCLID de cookies do Google (às vezes aparece em _gcl_au/aw)
+    if not out.get("gclid"):
+        for k in ("_gcl_au", "_gcl_aw"):
+            g = out.get(k)
+            if g and "." in g:
+                # formatos variam; tentamos pegar o último segmento alfanumérico longo
+                try:
+                    segs = [s for s in g.split(".") if len(s) >= 8]
+                    if segs:
+                        out["gclid_hint"] = segs[-1]
+                        break
+                except Exception:
+                    pass
+
+    # login id em cookie (se sua página setar)
+    for lk in ("login_id", "uid", "user_id"):
+        if out.get(lk) and not out.get("login_id"):
+            out["login_id"] = out[lk]
+
     return out
 
+def _merge_if_empty(dst: Dict[str, Any], src: Dict[str, Any], keys: List[str]) -> None:
+    for k in keys:
+        v = src.get(k)
+        if v is not None and (dst.get(k) in (None, "")):
+            dst[k] = v
+
 def _enrich_payload(data: dict, req: Request) -> dict:
+    """
+    Enriquecimento do bridge (first-party):
+    - IP real + Geo
+    - UA -> device/os/browser
+    - _fbp/_fbc coerentes (se já tem, preserva)
+    - cid/cid_hint/gclid_hint
+    - login_id / external_id (se vierem)
+    - NÃO inventa e-mail/telefone/zip; apenas propaga se vierem
+    """
+    # Deep copy leve
+    data = dict(data or {})
     ip = _extract_client_ip(req)
     ua = data.get("user_agent") or req.headers.get("user-agent")
     ck = _parse_cookies(req.headers.get("cookie"))
 
+    # Espelhar hints de cookies para o corpo (sem sobrescrever)
+    _merge_if_empty(data, ck, ["_fbp", "_fbc", "cid", "login_id"])
+    if ck.get("cid_hint") and not data.get("cid"):
+        data["cid"] = ck["cid_hint"]
+    if ck.get("gclid_hint") and not data.get("gclid"):
+        data["gclid"] = ck["gclid_hint"]
+
+    # fbc a partir de fbclid (se não vier pronto)
     if data.get("fbclid") and not data.get("_fbc"):
         data["_fbc"] = f"fb.1.{int(time.time())}.{data['fbclid']}"
+
+    # Garante fbp se ausente (first-party)
     if not data.get("_fbp"):
         data["_fbp"] = f"fb.1.{int(time.time())}.{secrets.randbelow(999_999_999)}"
-    if ck.get("_fbc") and not data.get("_fbc"):
-        data["_fbc"] = ck["_fbc"]
-    if ck.get("_fbp") and not data.get("_fbp"):
-        data["_fbp"] = ck["_fbp"]
 
-    if not data.get("cid"):
-        if data.get("gclid"):
-            data["cid"] = f"gclid.{data['gclid']}"
-        elif ck.get("cid_hint"):
-            data["cid"] = ck["cid_hint"]
+    # Também espelha em 'fbc'/'fbp' "limpos" (alguns pipelines consomem essas chaves)
+    if data.get("_fbc") and not data.get("fbc"):
+        data["fbc"] = data["_fbc"]
+    if data.get("_fbp") and not data.get("fbp"):
+        data["fbp"] = data["_fbp"]
 
+    # CID fallback (Measurement Protocol)
+    if not data.get("cid") and data.get("gclid"):
+        data["cid"] = f"gclid.{data['gclid']}"
+
+    # IP/Geo
     if ip:
         data.setdefault("ip", ip)
         geo = geo_lookup(ip)
@@ -437,19 +496,31 @@ def _enrich_payload(data: dict, req: Request) -> dict:
             data.setdefault("city", data.get("city") or geo.get("city"))
             data.setdefault("state", data.get("state") or geo.get("region"))
 
+    # UA/Device
     ua_info = parse_ua(ua)
     if ua_info:
         data.setdefault("user_agent", ua_info.get("ua"))
-        data.setdefault("device", data.get("device") or ua_info.get("device"))
-        data.setdefault("os", data.get("os") or ua_info.get("os"))
-        if "browser" in ua_info:
-            data.setdefault("browser", ua_info["browser"])
+        _merge_if_empty(data, ua_info, ["device", "os", "browser"])
 
+    # login_id via header/querystring (se enviado pelo front)
+    hdr_login = req.headers.get("X-Login-Id") or req.headers.get("x-login-id")
+    if hdr_login and not data.get("login_id"):
+        data["login_id"] = hdr_login
+    qs = dict(req.query_params) if req.query_params else {}
+    if qs.get("login_id") and not data.get("login_id"):
+        data["login_id"] = qs.get("login_id")
+
+    # external_id: se front mandar, preserva; senão, usa login_id como dica
+    if data.get("login_id") and not data.get("external_id"):
+        data["external_id"] = data["login_id"]
+
+    # timestamp de recepção
     data.setdefault("ts", int(time.time()))
 
+    # Optional: payload criptografado (debug/auditoria client-side)
     if fernet:
         try:
-            raw = json.dumps(data).encode()
+            raw = json.dumps(data, ensure_ascii=False).encode()
             data["_encrypted"] = fernet.encrypt(raw).decode()
         except Exception as e:
             logger.warning(f"⚠️ Encryption failed: {e}")
@@ -473,8 +544,19 @@ async def _maybe_async(fn, *args, **kwargs):
     return res
 
 # =============================
-# Rotas
+# App & Rotas
 # =============================
+app = FastAPI(title="Typebot Bridge", version="3.3")
+
+if ALLOWED_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=ALLOWED_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
 @app.get("/health")
 def health():
     try:
@@ -501,9 +583,9 @@ async def create_deeplink(
     x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
 ):
     _auth_guard(x_api_key, x_bridge_token, authorization)
-    data = _enrich_payload(body.dict(by_alias=True, exclude_none=True), req)
+    data = _enrich_payload(body.dict(exclude_none=True), req)
     token = _make_token()
-    redis.setex(_key(token), TOKEN_TTL_SEC, json.dumps(data))
+    redis.setex(_key(token), TOKEN_TTL_SEC, json.dumps(data, ensure_ascii=False))
     return {"deep_link": _deep_link(token), "token": token, "expires_in": TOKEN_TTL_SEC}
 
 @app.get("/tb/peek/{token}")
@@ -540,8 +622,9 @@ async def ingest_event(
     event_type: Optional[str] = "Lead"
 ):
     _auth_guard(x_api_key, x_bridge_token, authorization)
-    data = _enrich_payload(body.dict(by_alias=True, exclude_none=True), req)
+    data = _enrich_payload(body.dict(exclude_none=True), req)
 
+    # Persistência + envio (assíncronos e desacoplados)
     asyncio.create_task(_maybe_async(save_lead, data))
     asyncio.create_task(_maybe_async(send_event_to_all, data, et=event_type or "Lead"))
 
@@ -589,16 +672,28 @@ async def bridge(
 
 @app.get("/apply")
 async def apply_redirect(req: Request):
+    """
+    Endpoint de conversão direta (sem corpo). Extrai QS/cookies/UA/IP para gerar
+    um deep link Telegram com token efêmero no Redis.
+    """
     base_payload: Dict[str, Any] = {"source": "apply"}
     try:
         if req.query_params:
             base_payload["qs"] = dict(req.query_params)
+            # espelha campos comuns da QS no payload raiz (sem sobrescrever)
+            for k in (
+                "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+                "gclid", "gbraid", "wbraid", "fbclid", "cid", "city", "state", "zip", "country",
+                "login_id", "external_id", "email"
+            ):
+                if k in req.query_params and base_payload.get(k) in (None, ""):
+                    base_payload[k] = req.query_params.get(k)
     except Exception:
         pass
 
     data = _enrich_payload(base_payload, req)
     token = _make_token()
-    redis.setex(_key(token), TOKEN_TTL_SEC, json.dumps(data))
+    redis.setex(_key(token), TOKEN_TTL_SEC, json.dumps(data, ensure_ascii=False))
 
     logger.info(json.dumps({
         "event": "APPLY_REDIRECT",

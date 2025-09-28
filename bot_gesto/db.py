@@ -1,11 +1,18 @@
-# db.py — versão 3.1 (enriquecimento persistido, dedupe estável, payload completo no sync)
+# db.py — versão 3.2 (enriquecimento persistido, dedupe estável, payload completo no sync)
+# - Idempotência por event_key + event_id
+# - Espelhamento de UTM/CLIDs/GEO/Device/URL para custom_data (sem schema novo)
+# - Histórico de eventos consistente ({event_type,event_id,event_time,status,ts})
+# - Payload completo no sync/retrofeed (mesma estrutura do bot/bridge)
+# - Criptografia de cookies (Fernet ou base64)
+# - Nenhuma ENV nova obrigatória
+
 import os, asyncio, json, time, hashlib, base64, logging
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any
 
 import sys
 sys.path.append(os.path.dirname(__file__))
-import utils  # mantém compat (normalize, dedupe, clamp, etc.)
+import utils  # normalize/dedupe/clamp/helpers (mantém compat)
 
 from sqlalchemy import (
     create_engine, Column, Integer, String, Boolean,
@@ -100,25 +107,23 @@ class Lead(Base):
     event_key = Column(String(128), unique=True, nullable=False, index=True)
     telegram_id = Column(String(128), index=True, nullable=False)
 
-    event_type = Column(String(50), index=True)   # "Lead" (principal) ou "Subscribe" (apenas histórico)
+    event_type = Column(String(50), index=True)   # "Lead" principal, "Subscribe" somente histórico
     route_key = Column(String(50), index=True)    # ex.: "botb", "vip"
 
-    src_url = Column(Text, nullable=True)         # event_source_url/landing_url canônica
+    src_url = Column(Text, nullable=True)
     value = Column(Float, nullable=True)
     currency = Column(String(10), nullable=True)
 
-    # Armazenamento principal
-    user_data = Column(JSONB, nullable=False, default=dict)   # dados do usuário (plain), inclui ip/ua se vier
-    custom_data = Column(JSONB, nullable=True, default=dict)  # espelho de UTMs, clids, geo, device extras
+    user_data = Column(JSONB, nullable=False, default=dict)   # plain (email/phone/ip/ua/etc.)
+    custom_data = Column(JSONB, nullable=True, default=dict)  # espelho UTM/CLIDs/GEO/Device/URL
 
     cookies = Column(JSONB, nullable=True)        # cifrados
     device_info = Column(JSONB, nullable=True)    # device/os/browser/platform/url
     session_metadata = Column(JSONB, nullable=True)
 
-    # Estado de envio
     sent = Column(Boolean, default=False, index=True)
     sent_pixels = Column(JSONB, nullable=True, default=list)
-    event_history = Column(JSONB, nullable=True, default=list)  # lista de eventos ({event_type, event_id, event_time, status})
+    event_history = Column(JSONB, nullable=True, default=list)  # [{event_type,event_id,event_time,status,ts}]
 
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     last_attempt_at = Column(DateTime(timezone=True), nullable=True)
@@ -140,15 +145,16 @@ def init_db():
 # Helpers de espelhamento/merge
 # ==============================
 _UTM_KEYS = ("utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content")
-_CLID_KEYS = ("gclid", "wbraid", "gbraid", "fbclid", "cid", "_fbp", "_fbc")
+_CLID_KEYS = ("gclid", "wbraid", "gbraid", "fbclid", "cid", "_fbp", "_fbc", "click_id")  # inclui click_id se vier
 _GEO_KEYS = ("country", "state", "city", "zip")
 _DEVICE_TOP_KEYS = ("device", "os", "browser", "platform")
 _URL_KEYS = ("event_source_url", "landing_url", "src_url")
+_ID_KEYS = ("login_id",)  # opcional (útil para auditoria/normalização a jusante)
 
 def _mirror_into_custom(data: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Copia UTMs, clids, geo e device extras para custom_data, para persistir enriquecimento completo
-    sem exigir migração de schema. Não sobrescreve valores já existentes em custom_data.
+    Copia UTMs, CLIDs, GEO, Device extras, URL e IDs auxiliares para custom_data.
+    Não sobrescreve valores já existentes em custom_data.
     """
     base = dict(data.get("custom_data") or {})
     # UTMs
@@ -161,6 +167,11 @@ def _mirror_into_custom(data: Dict[str, Any]) -> Dict[str, Any]:
         v = data.get(k)
         if v is not None and base.get(k) in (None, ""):
             base[k] = v
+    # IDs auxiliares (ex.: login_id)
+    for k in _ID_KEYS:
+        v = data.get(k) or (data.get("user_data") or {}).get(k)
+        if v is not None and base.get(k) in (None, ""):
+            base[k] = v
     # GEO (também aceita nested geo)
     geo = data.get("geo") or {}
     for k in _GEO_KEYS:
@@ -169,7 +180,7 @@ def _mirror_into_custom(data: Dict[str, Any]) -> Dict[str, Any]:
             v = geo.get("region" if k == "state" else k)
         if v is not None and base.get(k) in (None, ""):
             base[k] = v
-    # Device extras no topo (caso venham fora de device_info)
+    # Device extras no topo
     for k in _DEVICE_TOP_KEYS:
         v = data.get(k)
         if v is not None and base.get(k) in (None, ""):
@@ -183,7 +194,7 @@ def _mirror_into_custom(data: Dict[str, Any]) -> Dict[str, Any]:
 
 def _best_src_url(data: Dict[str, Any]) -> Optional[str]:
     """
-    Resolve a melhor origem de URL (event_source_url > src_url > landing_url > device_info.url).
+    Resolve melhor origem de URL (event_source_url > src_url > landing_url > device_info.url).
     """
     di = data.get("device_info") or {}
     return (
@@ -195,12 +206,11 @@ def _best_src_url(data: Dict[str, Any]) -> Optional[str]:
 
 def _latest_event_time(row: Lead) -> int:
     """
-    Recupera o event_time mais recente do histórico; fallback created_at.
+    Recupera event_time mais recente do histórico; fallback created_at.
     """
     try:
         hist = row.event_history or []
         if hist:
-            # pega o último com event_time, senão usa created_at
             for ev in reversed(hist):
                 et = ev.get("event_time")
                 if isinstance(et, (int, float)) and et > 0:
@@ -211,15 +221,20 @@ def _latest_event_time(row: Lead) -> int:
 
 def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
     """
-    Reconstrói o LEAD COMPLETO para envio aos pixels (mesma estrutura do bot/bridge).
-    Esse era o ponto que derrubava o score quando reprocessava pendentes.
+    Reconstrói o LEAD COMPLETO para envio aos pixels.
+    (fixture crítica para manter score alto no reprocessamento)
     """
     user = row.user_data or {}
     custom = row.custom_data or {}
     cookies = _safe_dict(row.cookies or {}, decrypt=True)
     di = row.device_info or {}
 
-    # UTMs/CLIDs/geo/url reproduzidos do custom_data
+    # fallback fbp/fbc se só houver fbclid (coerente com bot)
+    _fbp = custom.get("_fbp") or user.get("fbp")
+    _fbc = custom.get("_fbc") or user.get("fbc")
+    if not _fbc and custom.get("fbclid"):
+        _fbc = f"fb.1.{int(time.time())}.fbclid.{row.telegram_id}"
+
     lead: Dict[str, Any] = {
         "telegram_id": row.telegram_id,
         "event_key": row.event_key,
@@ -230,7 +245,7 @@ def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
         "value": row.value,
         "currency": row.currency,
 
-        # cookies descriptografados (já prontos pro Bridge/Bot)
+        # cookies descriptografados (auditoria interna)
         "cookies": cookies,
 
         # device_info íntegro
@@ -255,42 +270,46 @@ def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
         "utm_term": custom.get("utm_term"),
         "utm_content": custom.get("utm_content"),
 
-        # Click IDs (inclui cid e _fbp/_fbc se foram espelhados)
+        # Click IDs (inclui cid e _fbp/_fbc)
         "gclid": custom.get("gclid"),
         "wbraid": custom.get("wbraid"),
         "gbraid": custom.get("gbraid"),
         "fbclid": custom.get("fbclid"),
         "cid": custom.get("cid"),
-        "_fbp": custom.get("_fbp"),
-        "_fbc": custom.get("_fbc"),
+        "_fbp": _fbp,
+        "_fbc": _fbc,
+        "click_id": custom.get("click_id"),
 
-        # Geo/Localização (se foi espelhado)
+        # IDs auxiliares
+        "login_id": custom.get("login_id"),
+
+        # Geo/Localização
         "country": custom.get("country"),
         "state": custom.get("state"),
         "city": custom.get("city"),
         "zip": custom.get("zip"),
-
-        # Repasse de alguns campos úteis do user_data (sem hash)
-        "user_data": {
-            "email": user.get("email"),
-            "phone": user.get("phone"),
-            "first_name": user.get("first_name"),
-            "last_name": user.get("last_name"),
-            "city": user.get("city") or custom.get("city"),
-            "state": user.get("state") or custom.get("state"),
-            "zip": user.get("zip") or custom.get("zip"),
-            "country": user.get("country") or custom.get("country"),
-            "telegram_id": user.get("telegram_id") or row.telegram_id,
-            "external_id": user.get("external_id") or row.telegram_id,
-            "fbp": user.get("fbp") or custom.get("_fbp"),
-            "fbc": user.get("fbc") or custom.get("_fbc"),
-            # IP/UA reais (se existirem)
-            "ip": user.get("ip"),
-            "ua": user.get("ua"),
-        },
     }
 
-    # Completa user_agent no topo (útil para alguns parsers/clientes)
+    # Repasse de alguns campos úteis do user_data (plain)
+    lead["user_data"] = {
+        "email": user.get("email"),
+        "phone": user.get("phone"),
+        "first_name": user.get("first_name"),
+        "last_name": user.get("last_name"),
+        "city": user.get("city") or custom.get("city"),
+        "state": user.get("state") or custom.get("state"),
+        "zip": user.get("zip") or custom.get("zip"),
+        "country": user.get("country") or custom.get("country"),
+        "telegram_id": user.get("telegram_id") or row.telegram_id,
+        "external_id": user.get("external_id") or row.telegram_id,
+        "fbp": user.get("fbp") or _fbp,
+        "fbc": user.get("fbc") or _fbc,
+        "ip": user.get("ip"),
+        "ua": user.get("ua"),
+        "login_id": user.get("login_id"),
+    }
+
+    # user_agent no topo (qualifica parsing a jusante)
     if user.get("ua"):
         lead["user_agent"] = user["ua"]
 
@@ -300,7 +319,7 @@ def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
     return lead
 
 # ==============================
-# Priority Score (opcional, para relatórios)
+# Priority Score (opcional)
 # ==============================
 def compute_priority_score(user_data: Dict[str, Any], custom_data: Dict[str, Any]) -> float:
     score = 0.0
@@ -321,8 +340,8 @@ def compute_priority_score(user_data: Dict[str, Any], custom_data: Dict[str, Any
 async def save_lead(data: dict, event_record: Optional[dict] = None, retries: int = 3) -> bool:
     """
     Salva/atualiza um Lead de forma idempotente e persiste TODO o enriquecimento relevante.
-    - Espelha UTMs/CLIDs/GEO/URL/Device em custom_data (sem schema novo).
-    - Guarda histórico de eventos com {event_type, event_id, event_time, status}.
+    - Espelha UTMs/CLIDs/GEO/URL/Device/IDs em custom_data
+    - Guarda histórico de eventos com {event_type,event_id,event_time,status,ts}
     """
     if not SessionLocal:
         logger.warning("DB desativado - save_lead ignorado")
@@ -337,19 +356,19 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
             try:
                 ek = data.get("event_key")
                 telegram_id = str(data.get("telegram_id"))
-                etype = data.get("event_type") or "Lead"    # padrão A: lead principal
+                etype = data.get("event_type") or "Lead"
                 if not ek or not telegram_id:
                     logger.warning(f"[SAVE_LEAD] evento inválido: ek={ek} tg={telegram_id}")
                     return False
 
                 # event_time/event_id estáveis
                 event_time = utils.clamp_event_time(int(data.get("event_time") or utils.now_ts()))
-                # NOTE: event_id estável (se vier pronto, usamos)
                 event_id = utils.get_or_build_event_id(etype, data, event_time)
 
-                # espelhar enriquecimento no custom_data
+                # espelhamento para custom_data
                 custom = _mirror_into_custom(data)
-                # score opcional
+
+                # prioridade opcional
                 normalized_ud = data.get("user_data") or {"telegram_id": telegram_id}
                 custom["priority_score"] = compute_priority_score(normalized_ud, custom)
 
@@ -361,17 +380,21 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
                 lead = session.query(Lead).filter(Lead.event_key == ek).first()
                 if lead:
                     logger.info(f"[DB_UPDATE] ek={ek} tipo={etype}")
-                    # merge user_data (plain)
+                    # merge user_data
                     lead.user_data = {**(lead.user_data or {}), **normalized_ud}
-                    # merge custom_data (espelhado)
+                    # merge custom_data
                     lead.custom_data = {**(lead.custom_data or {}), **custom}
                     lead.event_type = etype
-                    # src_url canônico (uma vez definido, só melhora se vier melhor)
-                    lead.src_url = _best_src_url({"event_source_url": data.get("event_source_url"),
-                                                  "src_url": data.get("src_url") or lead.src_url,
-                                                  "landing_url": data.get("landing_url"),
-                                                  "device_info": data.get("device_info")})
-                    lead.value = data.get("value") if data.get("value") is not None else lead.value
+                    # src_url canônico
+                    lead.src_url = _best_src_url({
+                        "event_source_url": data.get("event_source_url"),
+                        "src_url": data.get("src_url") or lead.src_url,
+                        "landing_url": data.get("landing_url"),
+                        "device_info": data.get("device_info")
+                    })
+                    # valor/moeda
+                    if data.get("value") is not None:
+                        lead.value = data.get("value")
                     lead.currency = data.get("currency") or lead.currency
                     # cookies
                     if enc_cookies:
@@ -388,7 +411,7 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
                         sm = lead.session_metadata or {}
                         sm.update(data["session_metadata"])
                         lead.session_metadata = sm
-                    # event history (dedupe por event_id)
+                    # histórico (dedupe por event_id)
                     eh = lead.event_history or []
                     if not any(ev.get("event_id") == event_id for ev in eh):
                         eh.append({
@@ -424,7 +447,7 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
                     )
                     session.add(lead)
 
-                # marcações de tentativa/ok (não setamos sent=True aqui; isso é feito após tentar enviar)
+                # marcações tentativa/ok
                 if event_record:
                     if event_record.get("status") == "success":
                         lead.last_sent_at = datetime.now(timezone.utc)
@@ -556,8 +579,11 @@ async def sync_pending_leads(batch_size: int = 20) -> int:
     if not rows:
         return 0
 
-    # Import lazy para evitar ciclos
-    from bot_gesto.fb_google import send_event_to_all
+    # Import lazy para evitar ciclos de import
+    try:
+        from bot_gesto.fb_google import send_event_to_all  # quando rodando como pacote
+    except Exception:
+        from fb_google import send_event_to_all  # fallback quando rodando solto
 
     processed = 0
     for row in rows:
@@ -568,10 +594,8 @@ async def sync_pending_leads(batch_size: int = 20) -> int:
             ok = any((isinstance(v, dict) and v.get("ok")) for v in (results or {}).values())
             session = SessionLocal()
             try:
-                # refresh row preso ao session de gravação
                 obj = session.query(Lead).filter(Lead.id == row.id).first()
                 if not obj:
-                    # edge case: deletado entre fetch e commit
                     session.close()
                     processed += 1
                     continue

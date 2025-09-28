@@ -1,4 +1,4 @@
-# utils.py — versão 2.2 (robustez de dedupe, normalização user_data, GA4 refinado)
+# utils.py — versão 3.1 (dedupe sólido, user_data avançado, fbc correto, login_id, CEP/ZIP, GA4 refinado)
 import os, re, time, hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional
@@ -7,8 +7,8 @@ from urllib.parse import urlparse
 # ==============================
 # Config
 # ==============================
-DROP_OLD_DAYS = int(os.getenv("FB_DROP_OLDER_THAN_DAYS", "7"))  # janela máx aceitada pelo FB
-ACTION_SOURCE = os.getenv("FB_ACTION_SOURCE", "website")        # sug.: "chat" para Telegram
+DROP_OLD_DAYS = int(os.getenv("FB_DROP_OLDER_THAN_DAYS", "7"))  # janela máx aceita pelo FB
+ACTION_SOURCE = os.getenv("FB_ACTION_SOURCE", "website")        # sug.: "chat" p/ Telegram
 EVENT_ID_SALT = os.getenv("EVENT_ID_SALT", "change_me")
 
 SEND_LEAD_ON = (os.getenv("SEND_LEAD_ON", "botb") or "").lower()
@@ -67,15 +67,6 @@ def _first_non_empty(*vals) -> Optional[str]:
         return v
     return None
 
-def _safe_bool(v: Any) -> bool:
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return bool(v)
-    if isinstance(v, str):
-        return v.strip().lower() in {"1", "true", "yes", "y", "on"}
-    return False
-
 def _strip_empty(d: Dict[str, Any]) -> Dict[str, Any]:
     """
     Remove chaves com None ou strings vazias. Mantém zeros/False.
@@ -100,11 +91,38 @@ def _url_or_none(u: Optional[str]) -> Optional[str]:
     if not s:
         return None
     p = urlparse(s)
-    # aceita: tem esquema + netloc, ou pelo menos algo que não seja só espaço
-    if p.scheme and p.netloc:
+    # aceita: tem esquema + netloc, ou caminho relativo/absoluto
+    if (p.scheme and p.netloc) or s.startswith(("/", "./", "../")):
         return s
-    # sem esquema: pode ser uma URL relativa (o FB aceita event_source_url opcionalmente)
+    # pode ser algo como "example.com/..." sem esquema — ainda útil para logging/atribuição
     return s
+
+# ==============================
+# Normalizações específicas
+# ==============================
+def _norm_zip_or_cep(s: Optional[str], country: Optional[str]) -> str:
+    """
+    Normaliza ZIP/CEP antes do hashing:
+    - BR: mantém só dígitos (idealmente 8, mas não forçamos), sem criar dado fictício.
+    - Outros: remove espaços e deixa minúsculo.
+    """
+    if not s:
+        return ""
+    ctry = _norm(country)
+    if ctry in ("br", "brazil"):
+        return _only_digits(s)
+    return _norm(s)
+
+def _compute_fbc_from_fbclid(fbclid: Optional[str], ts: Optional[int]) -> Optional[str]:
+    """
+    Constrói fbc válido a partir de fbclid, se possível.
+    Formato: fb.1.<timestamp>.<fbclid>
+    """
+    if not fbclid:
+        return None
+    # usa o timestamp do evento (já "clampado") para estabilidade
+    t = int(ts or now_ts())
+    return f"fb.1.{t}.{fbclid}"
 
 # ==============================
 # Deduplicação
@@ -113,13 +131,15 @@ def build_event_id(event_name: str, lead: Dict[str, Any], event_time: int) -> st
     """
     Cria um ID único e determinístico para deduplicar eventos no Facebook.
     Usa salt fixo para evitar colisões.
-    Mantém lógica original e acrescenta robustez em chaves opcionais.
+    Chaves consideradas incluem fbp/fbc/gclid/gbraid/wbraid e click_id.
     """
     keys = [
         _norm(str(event_name)),
         _norm(str(lead.get("telegram_id") or "")),
         _norm(str(lead.get("external_id") or "")),
+        _norm(str(lead.get("login_id") or "")),      # novo: login_id entra no dedupe
         _norm(str(lead.get("click_id") or "")),
+        _norm(str(lead.get("fbclid") or "")),        # útil para estabilidade
         _norm(str(lead.get("fbp") or lead.get("_fbp") or "")),
         _norm(str(lead.get("fbc") or lead.get("_fbc") or "")),
         _norm(str(lead.get("gclid") or "")),
@@ -133,7 +153,7 @@ def build_event_id(event_name: str, lead: Dict[str, Any], event_time: int) -> st
 def get_or_build_event_id(event_name: str, lead: Dict[str, Any], event_time: int) -> str:
     """
     Se já houver event_id persistido/sugerido no lead, usa-o (estabiliza dedupe).
-    Caso contrário, gera via build_event_id (lógica original).
+    Caso contrário, gera via build_event_id (lógica original + aprimoramentos).
     """
     existing = _norm(str(lead.get("event_id") or ""))
     return existing if existing else build_event_id(event_name, lead, event_time)
@@ -145,16 +165,20 @@ def normalize_user_data(raw: Dict[str, Any]) -> Dict[str, Any]:
     """
     Prepara user_data para o Facebook CAPI (hashing SHA256 quando requerido).
     Enriquecido: cobre email, telefone, nome, localização, IDs técnicos.
-    Robusto para receber 'raw' sendo tanto o próprio user_data quanto o lead completo.
+    Aceita 'raw' sendo o próprio user_data OU o lead completo.
+    - fbc correto a partir de fbclid quando fbc ausente.
+    - external_id prioriza: raw.external_id > raw.login_id > raw.telegram_id > raw.user_id
+    - CEP/ZIP normalizado por país.
     """
     if not raw:
         return {}
 
     # Se 'raw' for o lead completo, pode existir um sub-bloco 'user_data'
     ud_src = raw.get("user_data") if isinstance(raw, dict) else None
+
     def pick(*paths):
         """
-        Procura o primeiro valor existente entre uma sequência de chaves simples ou tuplas (para acessar nested).
+        Procura o primeiro valor existente entre chaves simples ou tuplas (para nested):
         Ex.: pick("email", ("user_data","email"))
         """
         for p in paths:
@@ -172,27 +196,37 @@ def normalize_user_data(raw: Dict[str, Any]) -> Dict[str, Any]:
                     return raw.get(p)
         return None
 
+    # Contato / nome
     email = _norm(pick("email"))
     phone = _only_digits(pick("phone"))
     fn = _norm(pick("first_name"))
     ln = _norm(pick("last_name"))
 
-    # Localização: tenta direto, depois dentro de 'geo'
+    # Localização (direto ou via geo)
     country = _norm(_first_non_empty(pick("country"), raw.get("geo", {}).get("country")))
     st = _norm(_first_non_empty(pick("state"), raw.get("geo", {}).get("region")))
     ct = _norm(_first_non_empty(pick("city"), raw.get("geo", {}).get("city")))
-    zp = _norm(pick("zip"))
 
-    # IDs
-    external_id = _norm(str(_first_non_empty(pick("external_id"),
-                                             pick("telegram_id"),
-                                             raw.get("telegram_id")) or ""))
+    # CEP/ZIP pode vir como "zip", "postal_code" ou "cep"
+    zip_raw = _first_non_empty(pick("zip"), pick("postal_code"), pick("cep"))
+    zp = _norm_zip_or_cep(zip_raw, country)
 
-    # fbp/fbc: prioriza chaves "limpas" (não pega cookies possivelmente criptografados)
+    # IDs de usuário/login
+    external_id_src = _first_non_empty(
+        pick("external_id"),
+        pick("login_id"),            # novo: login_id mapeado para external_id
+        pick("telegram_id"),
+        pick("user_id"),
+    )
+    external_id = _norm(str(external_id_src or ""))
+
+    # clids / cookies
+    fbclid = pick("fbclid")
     fbp_val = _first_non_empty(pick("fbp"), raw.get("_fbp"))
-    fbc_val = _first_non_empty(pick("fbc"), raw.get("_fbc"))
+    # fbc: usa o fornecido; se ausente, deriva de fbclid
+    fbc_val = _first_non_empty(pick("fbc"), raw.get("_fbc")) or _compute_fbc_from_fbclid(fbclid, clamp_event_time(pick("event_time")))
 
-    # IP & UA: tolera variações ('ip'/'ip_address' e 'ua'/'user_agent')
+    # IP & UA (variações: ip/ip_address e ua/user_agent)
     ip_val = _first_non_empty(pick("ip"), pick("ip_address"))
     ua_val = _first_non_empty(pick("ua"), pick("user_agent"))
 
@@ -220,7 +254,7 @@ def normalize_user_data(raw: Dict[str, Any]) -> Dict[str, Any]:
 # ==============================
 # Escolha do evento (Lead/Subscribe)
 # ==============================
-def derive_event_from_route(route_key: str) -> Optional[str]:
+def derive_event_from_route(route_key: Optional[str]) -> Optional[str]:
     """
     Decide dinamicamente se a rota representa Lead ou Subscribe,
     com base em SEND_LEAD_ON / SEND_SUBSCRIBE_ON.
@@ -248,41 +282,58 @@ def build_fb_payload(pixel_id: str, event_name: str, lead: Dict[str, Any]) -> Di
     """
     Monta payload completo para envio ao Facebook CAPI.
     Enriquecimento avançado: inclui dados UTM, device_info e deduplicação.
-    Mantém lógica anterior e acrescenta tolerância e limpeza de campos.
+    Tolerante a variações de chaves; não inventa dados sensíveis.
     """
-    # event_time estável: prioriza o do lead/DB e "clampa" na janela aceita
+    # event_time estável (clamp)
     raw_time = int(lead.get("event_time") or now_ts())
     etime = clamp_event_time(raw_time)
 
-    # event_id estável: se vier pronto do DB, usa; senão, gera determinístico
+    # event_id estável: usa o existente ou gera determinístico
     evid = get_or_build_event_id(event_name, lead, etime)
 
-    # Normalização user_data (pode vir como lead inteiro ou bloco user_data)
+    # Normalização user_data (aceita lead inteiro ou bloco user_data)
     user_data = normalize_user_data(lead.get("user_data") or lead)
 
     # Enriquecimento custom_data
-    # Mantém originais e inclui opcionais úteis se existirem (sem quebrar compat)
     device_info = lead.get("device_info") or {}
     custom_data = {
         "currency": lead.get("currency") or "BRL",
         "value": lead.get("value") or 0,
+
+        # UTM
         "utm_source": lead.get("utm_source"),
         "utm_medium": lead.get("utm_medium"),
         "utm_campaign": lead.get("utm_campaign"),
         "utm_term": lead.get("utm_term"),
         "utm_content": lead.get("utm_content"),
+
+        # Device/Plataforma (não sensível; FB ignora o que não reconhecer)
         "device": device_info.get("device") or lead.get("device"),
         "os": device_info.get("os") or lead.get("os"),
-        # opcionais: sem impacto negativo (o FB ignora não reconhecidos)
         "browser": device_info.get("browser") or lead.get("browser"),
         "platform": device_info.get("platform") or lead.get("platform"),
+
+        # Localidade (não sensível porque já tipicamente pública no lead/geo)
         "city": lead.get("city") or (lead.get("geo") or {}).get("city"),
         "state": lead.get("state") or (lead.get("geo") or {}).get("region"),
         "country": lead.get("country") or (lead.get("geo") or {}).get("country"),
+
+        # IDs de clique úteis para debug/atribuição (custom fields)
+        "fbclid": lead.get("fbclid"),
+        "gclid": lead.get("gclid"),
+        "gbraid": lead.get("gbraid"),
+        "wbraid": lead.get("wbraid"),
+        "click_id": lead.get("click_id"),
+
+        # Identificação de login (campo custom; o ID oficial para CAPI é external_id já no user_data)
+        "login_id": lead.get("login_id"),
+
+        # CEP/ZIP bruto (para debug/BI; o FB usa o hash no user_data['zp'])
+        "zip_raw": _first_non_empty(lead.get("zip"), lead.get("postal_code"), lead.get("cep")),
     }
     custom_data = _strip_empty(custom_data)
 
-    # event_source_url real (aceita várias origens, sem ser agressivo na correção)
+    # event_source_url
     event_source_url = _first_non_empty(
         lead.get("event_source_url"),
         lead.get("src_url"),
@@ -321,7 +372,7 @@ def build_ga4_payload(event_name: str, lead: Dict[str, Any]) -> Dict[str, Any]:
     """
     Monta payload para envio ao GA4 (Measurement Protocol).
     Enriquecido com UTM, device e suporte a client_id/telegram_id.
-    Mantém lógica e acrescenta boas práticas ('page_location' e 'engagement_time_msec').
+    Inclui page_location e engagement_time_msec (>0) como boa prática.
     """
     device_info = lead.get("device_info") or {}
 
@@ -331,7 +382,7 @@ def build_ga4_payload(event_name: str, lead: Dict[str, Any]) -> Dict[str, Any]:
         or lead.get("cid")
         or (GA4_CLIENT_ID_FALLBACK_PREFIX + str(lead.get("telegram_id") or lead.get("external_id") or "anon"))
     )
-    user_id = str(lead.get("telegram_id") or lead.get("external_id") or "")
+    user_id = str(lead.get("telegram_id") or lead.get("external_id") or lead.get("login_id") or "")
 
     page_location = _first_non_empty(
         lead.get("event_source_url"),
@@ -339,6 +390,7 @@ def build_ga4_payload(event_name: str, lead: Dict[str, Any]) -> Dict[str, Any]:
         device_info.get("url"),
     )
 
+    # Permite parametros custom seguro; GA4 aceita chaves arbitrárias
     params = {
         # tráfego/utm
         "source": lead.get("utm_source"),
@@ -360,7 +412,19 @@ def build_ga4_payload(event_name: str, lead: Dict[str, Any]) -> Dict[str, Any]:
         "browser": device_info.get("browser") or lead.get("browser"),
         "platform": device_info.get("platform") or lead.get("platform"),
 
-        # mínimo de engajamento para alguns eventos (boa prática)
+        # clids úteis p/ análise no GA4
+        "fbclid": lead.get("fbclid"),
+        "gclid": lead.get("gclid"),
+        "gbraid": lead.get("gbraid"),
+        "wbraid": lead.get("wbraid"),
+
+        # localização (param custom no GA4 — opcional)
+        "city": lead.get("city") or (lead.get("geo") or {}).get("city"),
+        "region": lead.get("state") or (lead.get("geo") or {}).get("region"),
+        "country": lead.get("country") or (lead.get("geo") or {}).get("country"),
+        "postal_code": _first_non_empty(lead.get("zip"), lead.get("postal_code"), lead.get("cep")),
+
+        # mínima duração de engajamento
         "engagement_time_msec": 1,
     }
     params = _strip_empty(params)
