@@ -1,8 +1,9 @@
-# db.py — versão 3.2 (enriquecimento persistido, dedupe estável, payload completo no sync)
+# db.py — versão 3.2.1
+# (enriquecimento persistido, dedupe estável, payload completo no sync)
 # - Idempotência por event_key + event_id
-# - Espelhamento de UTM/CLIDs/GEO/Device/URL para custom_data (sem schema novo)
-# - Histórico de eventos consistente ({event_type,event_id,event_time,status,ts})
-# - Payload completo no sync/retrofeed (mesma estrutura do bot/bridge)
+# - Espelhamento de UTM/CLIDs/GEO/Device/URL/IDs para custom_data (sem schema novo)
+# - Histórico consistente ({event_type,event_id,event_time,status,ts})
+# - Payload completo no sync/retrofeed (inclui event_id)
 # - Criptografia de cookies (Fernet ou base64)
 # - Nenhuma ENV nova obrigatória
 
@@ -107,7 +108,7 @@ class Lead(Base):
     event_key = Column(String(128), unique=True, nullable=False, index=True)
     telegram_id = Column(String(128), index=True, nullable=False)
 
-    event_type = Column(String(50), index=True)   # "Lead" principal, "Subscribe" somente histórico
+    event_type = Column(String(50), index=True)   # "Lead" principal, "Subscribe" só histórico
     route_key = Column(String(50), index=True)    # ex.: "botb", "vip"
 
     src_url = Column(Text, nullable=True)
@@ -219,10 +220,24 @@ def _latest_event_time(row: Lead) -> int:
     except Exception:
         return int(row.created_at.timestamp())
 
+def _latest_event_id(row: Lead) -> Optional[str]:
+    """
+    Recupera o último event_id salvo no histórico, se existir.
+    """
+    try:
+        hist = row.event_history or []
+        for ev in reversed(hist):
+            evid = ev.get("event_id")
+            if evid:
+                return str(evid)
+    except Exception:
+        pass
+    return None
+
 def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
     """
-    Reconstrói o LEAD COMPLETO para envio aos pixels.
-    (fixture crítica para manter score alto no reprocessamento)
+    Reconstrói o LEAD COMPLETO para envio aos pixels (com event_id).
+    (fixture crítica para manter score alto e dedupe perfeito no reprocessamento)
     """
     user = row.user_data or {}
     custom = row.custom_data or {}
@@ -235,11 +250,14 @@ def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
     if not _fbc and custom.get("fbclid"):
         _fbc = f"fb.1.{int(time.time())}.fbclid.{row.telegram_id}"
 
+    # event_time estável
+    event_time = _latest_event_time(row)
+
     lead: Dict[str, Any] = {
         "telegram_id": row.telegram_id,
         "event_key": row.event_key,
         "event_type": row.event_type or "Lead",
-        "event_time": _latest_event_time(row),
+        "event_time": event_time,
 
         # valores de negócio
         "value": row.value,
@@ -301,7 +319,7 @@ def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
         "zip": user.get("zip") or custom.get("zip"),
         "country": user.get("country") or custom.get("country"),
         "telegram_id": user.get("telegram_id") or row.telegram_id,
-        "external_id": user.get("external_id") or row.telegram_id,
+        "external_id": user.get("external_id") | row.telegram_id if isinstance(row.telegram_id, int) else (user.get("external_id") or row.telegram_id),
         "fbp": user.get("fbp") or _fbp,
         "fbc": user.get("fbc") or _fbc,
         "ip": user.get("ip"),
@@ -309,12 +327,20 @@ def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
         "login_id": user.get("login_id"),
     }
 
-    # user_agent no topo (qualifica parsing a jusante)
+    # user_agent no topo (qualifica parsers a jusante)
     if user.get("ua"):
         lead["user_agent"] = user["ua"]
 
     # src_url canônico
     lead["src_url"] = row.src_url or _best_src_url(lead)
+
+    # event_id: usa último salvo no histórico; se faltar, gera determinístico
+    last_event_id = _latest_event_id(row)
+    if last_event_id:
+        lead["event_id"] = last_event_id
+    else:
+        # Gera com a mesma regra do envio (determinístico)
+        lead["event_id"] = utils.get_or_build_event_id(lead.get("event_type") or "Lead", lead, event_time)
 
     return lead
 
@@ -581,9 +607,9 @@ async def sync_pending_leads(batch_size: int = 20) -> int:
 
     # Import lazy para evitar ciclos de import
     try:
-        from bot_gesto.fb_google import send_event_to_all  # quando rodando como pacote
+        from bot_gesto.fb_google import send_event_to_all  # pacote
     except Exception:
-        from fb_google import send_event_to_all  # fallback quando rodando solto
+        from fb_google import send_event_to_all           # fallback solto
 
     processed = 0
     for row in rows:

@@ -1,5 +1,7 @@
-# fb_google.py — v3.2 (Padrão A: envio direto, sem fila; idempotência; logs claros)
-# - Alinhado ao utils v3.x (fbc a partir de fbclid, login_id/external_id, ZIP/CEP)
+# fb_google.py — v3.2.1
+# (Padrão A: envio direto, sem fila; idempotência estável; logs claros)
+# - Usa get_or_build_event_id no dedupe (evita duplicidade entre envio imediato e sync_pending)
+# - Alinhado a utils v3.x (fbc a partir de fbclid, login_id/external_id, ZIP/CEP)
 # - Idempotência: Redis (SETNX+TTL) com fallback em memória
 # - Retry exponencial com jitter + timeouts
 # - Subscribe automático opcional a partir de Lead
@@ -18,7 +20,8 @@ try:
         build_fb_payload,
         build_ga4_payload,
         clamp_event_time,
-        build_event_id,
+        build_event_id,            # compat
+        get_or_build_event_id,     # <- USADO no dedupe estável
     )
 except Exception:
     # Fallback rodando solto
@@ -28,7 +31,8 @@ except Exception:
         build_fb_payload,
         build_ga4_payload,
         clamp_event_time,
-        build_event_id,
+        build_event_id,            # compat
+        get_or_build_event_id,     # <- USADO no dedupe estável
     )
 
 # ============================
@@ -141,13 +145,12 @@ def _coerce_lead(lead: Dict[str, Any]) -> Dict[str, Any]:
 
 def _event_dedupe_key(event_name: str, lead: Dict[str, Any]) -> str:
     """
-    Chave determinística compatível com dedupe por event_id:
-    - clamp_event_time
-    - build_event_id(event_name, lead, event_time)
+    Chave determinística compatível com dedupe por event_id.
+    Usa o event_id EXISTENTE quando presente (get_or_build_event_id),
+    evitando divergência entre o envio imediato (bot) e o reenvio (sync_pending).
     """
-    ts_raw = int(lead.get("event_time") or time.time())
-    ts = clamp_event_time(ts_raw)
-    eid = build_event_id(event_name, lead, ts)
+    ts = clamp_event_time(int(lead.get("event_time") or time.time()))
+    eid = get_or_build_event_id(event_name, lead, ts)  # <- aqui está a correção
     return f"{event_name.lower()}:{eid}"
 
 def _dedupe_check_and_mark(event_name: str, lead: Dict[str, Any]) -> bool:
