@@ -1,11 +1,11 @@
-# db.py — versão 3.2.1
-# (enriquecimento persistido, dedupe estável, payload completo no sync)
-# - Idempotência por event_key + event_id
-# - Espelhamento de UTM/CLIDs/GEO/Device/URL/IDs para custom_data (sem schema novo)
-# - Histórico consistente ({event_type,event_id,event_time,status,ts})
-# - Payload completo no sync/retrofeed (inclui event_id)
-# - Criptografia de cookies (Fernet ou base64)
-# - Nenhuma ENV nova obrigatória
+# db.py — v3.3 (enriquecimento persistido; sem dados fake; dedupe estável)
+# - NÃO inventa _fbp/_fbc, IP ou UA (apenas persiste o que veio do Bridge/Typebot/Bot).
+# - Idempotência por event_key + event_id (histórico sem duplicatas).
+# - Espelhamento de UTM/CLIDs/GEO/Device/URL/IDs para custom_data (sem schema novo).
+# - Histórico consistente: [{event_type,event_id,event_time,status,ts}].
+# - Payload completo no sync/retrofeed (inclui event_id).
+# - Criptografia de cookies (Fernet ou base64).
+# - Nenhuma ENV nova obrigatória.
 
 import os, asyncio, json, time, hashlib, base64, logging
 from datetime import datetime, timezone
@@ -13,7 +13,7 @@ from typing import List, Optional, Dict, Any
 
 import sys
 sys.path.append(os.path.dirname(__file__))
-import utils  # normalize/dedupe/clamp/helpers (mantém compat)
+import utils  # normalize/dedupe/clamp/helpers
 
 from sqlalchemy import (
     create_engine, Column, Integer, String, Boolean,
@@ -108,7 +108,7 @@ class Lead(Base):
     event_key = Column(String(128), unique=True, nullable=False, index=True)
     telegram_id = Column(String(128), index=True, nullable=False)
 
-    event_type = Column(String(50), index=True)   # "Lead" principal, "Subscribe" só histórico
+    event_type = Column(String(50), index=True)   # "Lead" principal, "Subscribe" apenas histórico
     route_key = Column(String(50), index=True)    # ex.: "botb", "vip"
 
     src_url = Column(Text, nullable=True)
@@ -116,7 +116,7 @@ class Lead(Base):
     currency = Column(String(10), nullable=True)
 
     user_data = Column(JSONB, nullable=False, default=dict)   # plain (email/phone/ip/ua/etc.)
-    custom_data = Column(JSONB, nullable=True, default=dict)  # espelho UTM/CLIDs/GEO/Device/URL
+    custom_data = Column(JSONB, nullable=True, default=dict)  # espelho UTM/CLIDs/GEO/Device/URL/IDs
 
     cookies = Column(JSONB, nullable=True)        # cifrados
     device_info = Column(JSONB, nullable=True)    # device/os/browser/platform/url
@@ -146,34 +146,40 @@ def init_db():
 # Helpers de espelhamento/merge
 # ==============================
 _UTM_KEYS = ("utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content")
-_CLID_KEYS = ("gclid", "wbraid", "gbraid", "fbclid", "cid", "_fbp", "_fbc", "click_id")  # inclui click_id se vier
+_CLID_KEYS = ("gclid", "wbraid", "gbraid", "fbclid", "cid", "_fbp", "_fbc", "click_id")
 _GEO_KEYS = ("country", "state", "city", "zip")
 _DEVICE_TOP_KEYS = ("device", "os", "browser", "platform")
 _URL_KEYS = ("event_source_url", "landing_url", "src_url")
-_ID_KEYS = ("login_id",)  # opcional (útil para auditoria/normalização a jusante)
+_ID_KEYS = ("login_id", "external_id")  # IDs auxiliares úteis para auditoria/normalização
 
 def _mirror_into_custom(data: Dict[str, Any]) -> Dict[str, Any]:
     """
     Copia UTMs, CLIDs, GEO, Device extras, URL e IDs auxiliares para custom_data.
-    Não sobrescreve valores já existentes em custom_data.
+    Não sobrescreve valores já existentes.
+    Não cria _fbp/_fbc/IP/UA: apenas espelha o que chegou.
     """
     base = dict(data.get("custom_data") or {})
+
     # UTMs
     for k in _UTM_KEYS:
         v = data.get(k)
         if v is not None and base.get(k) in (None, ""):
             base[k] = v
-    # Click IDs
+
+    # Click-IDs / cookies _fbp/_fbc já existentes
     for k in _CLID_KEYS:
         v = data.get(k)
         if v is not None and base.get(k) in (None, ""):
             base[k] = v
-    # IDs auxiliares (ex.: login_id)
+
+    # IDs auxiliares
+    ud = data.get("user_data") or {}
     for k in _ID_KEYS:
-        v = data.get(k) or (data.get("user_data") or {}).get(k)
+        v = data.get(k) or ud.get(k)
         if v is not None and base.get(k) in (None, ""):
             base[k] = v
-    # GEO (também aceita nested geo)
+
+    # GEO (aceita nested geo)
     geo = data.get("geo") or {}
     for k in _GEO_KEYS:
         v = data.get(k, None)
@@ -181,21 +187,24 @@ def _mirror_into_custom(data: Dict[str, Any]) -> Dict[str, Any]:
             v = geo.get("region" if k == "state" else k)
         if v is not None and base.get(k) in (None, ""):
             base[k] = v
+
     # Device extras no topo
     for k in _DEVICE_TOP_KEYS:
         v = data.get(k)
         if v is not None and base.get(k) in (None, ""):
             base[k] = v
+
     # URLs úteis
     for k in _URL_KEYS:
         v = data.get(k)
         if v is not None and base.get(k) in (None, ""):
             base[k] = v
+
     return base
 
 def _best_src_url(data: Dict[str, Any]) -> Optional[str]:
     """
-    Resolve melhor origem de URL (event_source_url > src_url > landing_url > device_info.url).
+    Resolve melhor origem de URL: event_source_url > src_url > landing_url > device_info.url.
     """
     di = data.get("device_info") or {}
     return (
@@ -237,20 +246,18 @@ def _latest_event_id(row: Lead) -> Optional[str]:
 def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
     """
     Reconstrói o LEAD COMPLETO para envio aos pixels (com event_id).
-    (fixture crítica para manter score alto e dedupe perfeito no reprocessamento)
+    NÃO fabrica _fbp/_fbc: apenas repassa se existirem; se só houver fbclid,
+    mantemos fbclid e deixamos utils.normalize_user_data derivar fbc no envio.
     """
     user = row.user_data or {}
     custom = row.custom_data or {}
     cookies = _safe_dict(row.cookies or {}, decrypt=True)
     di = row.device_info or {}
 
-    # fallback fbp/fbc se só houver fbclid (coerente com bot)
+    # NÃO criar fbp/fbc; apenas utilizar os existentes
     _fbp = custom.get("_fbp") or user.get("fbp")
     _fbc = custom.get("_fbc") or user.get("fbc")
-    if not _fbc and custom.get("fbclid"):
-        _fbc = f"fb.1.{int(time.time())}.fbclid.{row.telegram_id}"
 
-    # event_time estável
     event_time = _latest_event_time(row)
 
     lead: Dict[str, Any] = {
@@ -288,7 +295,7 @@ def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
         "utm_term": custom.get("utm_term"),
         "utm_content": custom.get("utm_content"),
 
-        # Click IDs (inclui cid e _fbp/_fbc)
+        # Click IDs e cookies (só os reais)
         "gclid": custom.get("gclid"),
         "wbraid": custom.get("wbraid"),
         "gbraid": custom.get("gbraid"),
@@ -300,6 +307,7 @@ def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
 
         # IDs auxiliares
         "login_id": custom.get("login_id"),
+        "external_id": custom.get("external_id") or user.get("external_id"),
 
         # Geo/Localização
         "country": custom.get("country"),
@@ -308,7 +316,13 @@ def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
         "zip": custom.get("zip"),
     }
 
-    # Repasse de alguns campos úteis do user_data (plain)
+    # Repasse dos campos úteis do user_data (plain)
+    # Sem fabricar IP/UA; apenas repassar se existirem.
+    ext_id_fallback = (
+        user.get("external_id")
+        or custom.get("external_id")
+        or str(row.telegram_id)
+    )
     lead["user_data"] = {
         "email": user.get("email"),
         "phone": user.get("phone"),
@@ -318,13 +332,13 @@ def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
         "state": user.get("state") or custom.get("state"),
         "zip": user.get("zip") or custom.get("zip"),
         "country": user.get("country") or custom.get("country"),
-        "telegram_id": user.get("telegram_id") or row.telegram_id,
-        "external_id": user.get("external_id") | row.telegram_id if isinstance(row.telegram_id, int) else (user.get("external_id") or row.telegram_id),
+        "telegram_id": user.get("telegram_id") or str(row.telegram_id),
+        "external_id": ext_id_fallback,
         "fbp": user.get("fbp") or _fbp,
         "fbc": user.get("fbc") or _fbc,
         "ip": user.get("ip"),
         "ua": user.get("ua"),
-        "login_id": user.get("login_id"),
+        "login_id": user.get("login_id") or custom.get("login_id"),
     }
 
     # user_agent no topo (qualifica parsers a jusante)
@@ -339,7 +353,6 @@ def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
     if last_event_id:
         lead["event_id"] = last_event_id
     else:
-        # Gera com a mesma regra do envio (determinístico)
         lead["event_id"] = utils.get_or_build_event_id(lead.get("event_type") or "Lead", lead, event_time)
 
     return lead
@@ -366,8 +379,9 @@ def compute_priority_score(user_data: Dict[str, Any], custom_data: Dict[str, Any
 async def save_lead(data: dict, event_record: Optional[dict] = None, retries: int = 3) -> bool:
     """
     Salva/atualiza um Lead de forma idempotente e persiste TODO o enriquecimento relevante.
-    - Espelha UTMs/CLIDs/GEO/URL/Device/IDs em custom_data
-    - Guarda histórico de eventos com {event_type,event_id,event_time,status,ts}
+    - NÃO cria _fbp/_fbc/IP/UA — só persiste o que veio.
+    - Espelha UTMs/CLIDs/GEO/URL/Device/IDs em custom_data.
+    - Guarda histórico {event_type,event_id,event_time,status,ts} sem duplicar event_id.
     """
     if not SessionLocal:
         logger.warning("DB desativado - save_lead ignorado")
@@ -380,18 +394,21 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
         while retries > 0:
             session = SessionLocal()
             try:
-                ek = data.get("event_key")
-                telegram_id = str(data.get("telegram_id"))
+                # Identidades
+                telegram_id = str(data.get("telegram_id") or "")
                 etype = data.get("event_type") or "Lead"
-                if not ek or not telegram_id:
-                    logger.warning(f"[SAVE_LEAD] evento inválido: ek={ek} tg={telegram_id}")
+                if not telegram_id:
+                    logger.warning("[SAVE_LEAD] evento inválido: telegram_id ausente")
                     return False
 
-                # event_time/event_id estáveis
+                # event_time + event_id estáveis
                 event_time = utils.clamp_event_time(int(data.get("event_time") or utils.now_ts()))
                 event_id = utils.get_or_build_event_id(etype, data, event_time)
 
-                # espelhamento para custom_data
+                # event_key (fallback determinístico se não vier)
+                ek = data.get("event_key") or f"tg-{telegram_id}-{event_time}"
+
+                # espelhamento para custom_data (somente sinais reais)
                 custom = _mirror_into_custom(data)
 
                 # prioridade opcional
@@ -406,11 +423,22 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
                 lead = session.query(Lead).filter(Lead.event_key == ek).first()
                 if lead:
                     logger.info(f"[DB_UPDATE] ek={ek} tipo={etype}")
-                    # merge user_data
-                    lead.user_data = {**(lead.user_data or {}), **normalized_ud}
+                    # merge user_data (sem sobrescrever com vazio)
+                    merged_ud = dict(lead.user_data or {})
+                    for k, v in (normalized_ud or {}).items():
+                        if v not in (None, ""):
+                            merged_ud[k] = v
+                    lead.user_data = merged_ud
+
                     # merge custom_data
-                    lead.custom_data = {**(lead.custom_data or {}), **custom}
+                    merged_cd = dict(lead.custom_data or {})
+                    for k, v in (custom or {}).items():
+                        if v not in (None, ""):
+                            merged_cd[k] = v
+                    lead.custom_data = merged_cd
+
                     lead.event_type = etype
+
                     # src_url canônico
                     lead.src_url = _best_src_url({
                         "event_source_url": data.get("event_source_url"),
@@ -418,25 +446,35 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
                         "landing_url": data.get("landing_url"),
                         "device_info": data.get("device_info")
                     })
-                    # valor/moeda
+
+                    # valor/moeda (apenas se fornecidos)
                     if data.get("value") is not None:
                         lead.value = data.get("value")
-                    lead.currency = data.get("currency") or lead.currency
+                    if data.get("currency"):
+                        lead.currency = data.get("currency")
+
                     # cookies
                     if enc_cookies:
                         ec = lead.cookies or {}
                         ec.update(enc_cookies)
                         lead.cookies = ec
+
                     # device_info
                     if data.get("device_info"):
                         di = lead.device_info or {}
-                        di.update(data["device_info"])
+                        for k, v in (data["device_info"] or {}).items():
+                            if v not in (None, ""):
+                                di[k] = v
                         lead.device_info = di
+
                     # session metadata
                     if data.get("session_metadata"):
                         sm = lead.session_metadata or {}
-                        sm.update(data["session_metadata"])
+                        for k, v in (data["session_metadata"] or {}).items():
+                            if v not in (None, ""):
+                                sm[k] = v
                         lead.session_metadata = sm
+
                     # histórico (dedupe por event_id)
                     eh = lead.event_history or []
                     if not any(ev.get("event_id") == event_id for ev in eh):
@@ -448,6 +486,7 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
                             "ts": datetime.now(timezone.utc).isoformat()
                         })
                         lead.event_history = eh
+
                 else:
                     logger.info(f"[DB_INSERT] Inserindo ek={ek} tipo={etype}")
                     lead = Lead(

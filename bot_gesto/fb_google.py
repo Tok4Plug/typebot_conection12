@@ -1,12 +1,10 @@
-# fb_google.py — v3.2.1
-# (Padrão A: envio direto, sem fila; idempotência estável; logs claros)
-# - Usa get_or_build_event_id no dedupe (evita duplicidade entre envio imediato e sync_pending)
-# - Alinhado a utils v3.x (fbc a partir de fbclid, login_id/external_id, ZIP/CEP)
-# - Idempotência: Redis (SETNX+TTL) com fallback em memória
-# - Retry exponencial com jitter + timeouts
-# - Subscribe automático opcional a partir de Lead
-# - GA4 opcional (Measurement Protocol), com modo debug opcional
-# - Logs estruturados sem vazar segredos
+# fb_google.py — v3.3 (envio direto; idempotência estável; sem dados fake)
+# - NÃO inventa _fbp/_fbc, IP ou UA (apenas repassa os sinais reais vindos do Bridge/Typebot/bot).
+# - Dedupe usa get_or_build_event_id => estável entre envio imediato e reprocesso (sync_pending/retrofeed).
+# - Retry exponencial + jitter; timeouts configuráveis.
+# - Auto-Subscribe opcional quando evento principal é Lead.
+# - GA4 opcional (Measurement Protocol), com modo debug opcional.
+# - Logs estruturados, sem vazar segredos.
 
 import os, aiohttp, asyncio, json, logging, random, time
 from typing import Dict, Any, Optional
@@ -20,8 +18,7 @@ try:
         build_fb_payload,
         build_ga4_payload,
         clamp_event_time,
-        build_event_id,            # compat
-        get_or_build_event_id,     # <- USADO no dedupe estável
+        get_or_build_event_id,   # <- usado no dedupe
     )
 except Exception:
     # Fallback rodando solto
@@ -31,8 +28,7 @@ except Exception:
         build_fb_payload,
         build_ga4_payload,
         clamp_event_time,
-        build_event_id,            # compat
-        get_or_build_event_id,     # <- USADO no dedupe estável
+        get_or_build_event_id,   # <- usado no dedupe
     )
 
 # ============================
@@ -41,7 +37,7 @@ except Exception:
 _redis, _redis_ok = None, False
 REDIS_URL = os.getenv("REDIS_URL", "")
 FB_DEDUP_REDIS = os.getenv("FB_DEDUP_REDIS", "1") == "1"   # usa Redis se houver
-FB_DEDUP_MEM = os.getenv("FB_DEDUP_MEM", "1") == "1"       # fallback memória
+FB_DEDUP_MEM   = os.getenv("FB_DEDUP_MEM", "1") == "1"     # fallback memória
 FB_DEDUP_TTL_SEC = int(os.getenv("FB_DEDUP_TTL_SEC", "3600"))  # 1h
 FB_DEDUP_PREFIX = os.getenv("FB_DEDUP_PREFIX", "capiev:ev:")
 
@@ -61,7 +57,7 @@ if REDIS_URL and FB_DEDUP_REDIS:
     except Exception:
         _redis_ok = False
 
-# Cache em memória: {event_key: expires_ts}
+# Cache em memória: {key: exp_ts}
 _mem_dedupe: Dict[str, float] = {}
 
 # ============================
@@ -72,7 +68,7 @@ FB_PIXEL_ID = os.getenv("FB_PIXEL_ID", "")
 FB_ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN", "")
 FB_TEST_EVENT_CODE = (os.getenv("FB_TEST_EVENT_CODE") or "").strip()  # opcional
 
-# Subscribe automático disparado a partir de um Lead
+# Auto-Subscribe a partir de Lead
 FB_AUTO_SUBSCRIBE_FROM_LEAD = os.getenv("FB_AUTO_SUBSCRIBE_FROM_LEAD", "1") == "1"
 
 # GA4
@@ -108,32 +104,27 @@ def _build_ga4_url() -> str:
 
 def _ensure_user_data_min(lead: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Garante que user_data exista e contenha campos mínimos (fbp/fbc/ip/ua)
-    sem sobrescrever o que já veio. O enriquecimento fino é feito em utils.
+    Garante que user_data exista e contenha campos mínimos (fbp/fbc/ip/ua),
+    SEM criar dados: apenas reaproveita os sinais reais já presentes.
     """
     ud: Dict[str, Any] = dict(lead.get("user_data") or {})
-
-    # fbp/fbc: prioriza já existentes; senão, usa _fbp/_fbc do bridge
     if "fbp" not in ud and lead.get("_fbp"):
         ud["fbp"] = lead["_fbp"]
     if "fbc" not in ud and lead.get("_fbc"):
         ud["fbc"] = lead["_fbc"]
-
-    # IP / UA
     if "ip" not in ud and lead.get("ip"):
         ud["ip"] = lead["ip"]
     if "ua" not in ud:
         ua = lead.get("user_agent") or lead.get("ua")
         if ua:
             ud["ua"] = ua
-
     return ud
 
 def _coerce_lead(lead: Dict[str, Any]) -> Dict[str, Any]:
     """
     Ajustes finais antes do envio:
-    - event_source_url: fallback para landing/src_url
-    - user_data: garante fbp/fbc/ip/ua mínimos
+    - event_source_url: fallback seguro para landing/src_url
+    - user_data: garante fbp/fbc/ip/ua mínimos (sem inventar)
     - flag interna anti-reentrância (auto-subscribe)
     """
     out = dict(lead or {})
@@ -145,12 +136,11 @@ def _coerce_lead(lead: Dict[str, Any]) -> Dict[str, Any]:
 
 def _event_dedupe_key(event_name: str, lead: Dict[str, Any]) -> str:
     """
-    Chave determinística compatível com dedupe por event_id.
-    Usa o event_id EXISTENTE quando presente (get_or_build_event_id),
-    evitando divergência entre o envio imediato (bot) e o reenvio (sync_pending).
+    Chave determinística compatível com dedupe por event_id e com toda a stack.
+    Usa get_or_build_event_id para respeitar event_id já definido no lead.
     """
     ts = clamp_event_time(int(lead.get("event_time") or time.time()))
-    eid = get_or_build_event_id(event_name, lead, ts)  # <- aqui está a correção
+    eid = get_or_build_event_id(event_name, lead, ts)
     return f"{event_name.lower()}:{eid}"
 
 def _dedupe_check_and_mark(event_name: str, lead: Dict[str, Any]) -> bool:
@@ -171,11 +161,10 @@ def _dedupe_check_and_mark(event_name: str, lead: Dict[str, Any]) -> bool:
             pass  # fallback memória
 
     if not FB_DEDUP_MEM:
-        return True  # sem memória e sem Redis: permite seguir
+        return True  # sem memória e sem Redis: segue
 
     # Memória (TTL simples)
     now = time.time()
-    # limpeza rápida
     expired = [k for k, exp in _mem_dedupe.items() if exp <= now]
     for k in expired:
         _mem_dedupe.pop(k, None)
@@ -206,7 +195,7 @@ async def _post_with_retry(
                     text = await resp.text()
                     if resp.status in (200, 201, 204):
                         return {"ok": True, "status": resp.status, "body": text, "platform": platform, "event": et}
-                    # tenta extrair erro estruturado para log melhor
+                    # erro retornado pela API
                     try:
                         j = json.loads(text)
                         if isinstance(j, dict) and "error" in j:
@@ -221,7 +210,7 @@ async def _post_with_retry(
             # backoff exponencial com jitter
             await asyncio.sleep((2 ** attempt) + random.random() * 0.5)
 
-    # log final de erro (sem vazar segredo)
+    # log final (sem vazar segredos)
     meta = {}
     try:
         d0 = payload.get("data", [{}])[0]
@@ -268,7 +257,7 @@ async def send_event_fb(event_name: str, lead: Dict[str, Any]) -> Dict[str, Any]
         return {"ok": True, "status": 209, "body": "dedup_skip", "platform": "facebook", "event": event_name}
 
     url = _build_fb_url()
-    coerced = _coerce_lead(lead)
+    coerced = _coerce_lead(lead)  # sem inventar dados
     payload = build_fb_payload(FB_PIXEL_ID, event_name, coerced)
 
     res = await _post_with_retry(url, payload, retries=FB_RETRY_MAX, platform="facebook", et=event_name)
@@ -293,7 +282,7 @@ async def send_event_google(event_name: str, lead: Dict[str, Any]) -> Dict[str, 
         return {"skip": True, "reason": "google disabled"}
 
     url = _build_ga4_url()
-    coerced = _coerce_lead(lead)
+    coerced = _coerce_lead(lead)  # sem inventar dados
     payload = build_ga4_payload(event_name, coerced)
 
     res = await _post_with_retry(url, payload, retries=GA_RETRY_MAX, platform="ga4", et=event_name)

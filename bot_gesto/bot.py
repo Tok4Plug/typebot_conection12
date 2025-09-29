@@ -1,9 +1,11 @@
-# bot.py — v3.2 (Padrão A: envio direto, sem fila; enriquecimento completo + dedupe estável)
-# - Parser robusto de /start: t_<token> (Redis), JSON inline, Base64URL (b64:), query "k=v&..."
-# - Enriquecimento: fbc a partir de fbclid, login_id, click_id, zip/cep, external_id
-# - event_id já calculado (estável) para manter dedupe consistente em toda a stack
-# - Sem IP/UA inventados (usa apenas os reais do bridge quando existirem)
+# bot.py — v3.3 (envio direto; enriquecimento completo; sem fake; dedupe estável)
+# - Parser de /start robusto: t_<token> (Redis), JSON inline, Base64URL (b64:...), e k=v&...
+# - Enriquecimento real: fbc somente se vier _fbc OU fbclid; nunca “fake”
+# - login_id → external_id (identificação de login); zip/cep; click_id
+# - event_id calculado já no bot (mantém dedupe consistente em toda a stack)
+# - Sem IP/UA inventados (usa apenas os do bridge quando existirem)
 # - Logs estruturados + métricas Prometheus
+# - Nenhuma ENV nova obrigatória
 
 import os, logging, json, asyncio, time, base64
 from datetime import datetime
@@ -44,17 +46,17 @@ ch.setFormatter(JSONFormatter())
 logger.addHandler(ch)
 
 # =============================
-# ENV
+# ENV (nenhuma nova obrigatória)
 # =============================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-VIP_CHANNEL = os.getenv("VIP_CHANNEL")  # chat_id do canal VIP (numérico)
+VIP_CHANNEL = os.getenv("VIP_CHANNEL")                  # chat_id numérico do canal VIP
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 SYNC_INTERVAL_SEC = int(os.getenv("SYNC_INTERVAL_SEC", "60"))
 BRIDGE_NS = os.getenv("BRIDGE_NS", "typebot")
 VIP_PUBLIC_USERNAME = (os.getenv("VIP_PUBLIC_USERNAME") or "").strip().lstrip("@")
 
-# Anti-duplicidade leve no /start (opcional)
-LEAD_THROTTLE_SEC = int(os.getenv("LEAD_THROTTLE_SEC", "0"))  # 0 = desliga
+# opcional: anti-flood leve no /start (0 = desliga)
+LEAD_THROTTLE_SEC = int(os.getenv("LEAD_THROTTLE_SEC", "0"))
 
 SECRET_KEY = os.getenv("SECRET_KEY", Fernet.generate_key().decode())
 fernet = Fernet(SECRET_KEY.encode() if isinstance(SECRET_KEY, str) else SECRET_KEY)
@@ -111,10 +113,9 @@ def _try_parse_json(s: str) -> Optional[Dict[str, Any]]:
 
 def _try_parse_b64url(s: str) -> Optional[Dict[str, Any]]:
     """
-    Aceita 'b64:<payload>' ou diretamente um blob base64url.
+    Aceita 'b64:<payload>' ou um blob base64url direto; tenta JSON primeiro, depois k=v&...
     """
     raw = s[4:] if s.startswith("b64:") else s
-    # normaliza padding
     padding = '=' * (-len(raw) % 4)
     try:
         decoded = base64.urlsafe_b64decode(raw + padding).decode()
@@ -123,9 +124,6 @@ def _try_parse_b64url(s: str) -> Optional[Dict[str, Any]]:
         return None
 
 def _try_parse_kv(s: str) -> Optional[Dict[str, Any]]:
-    """
-    Aceita formato 'k=v&x=y'. Não suporta nested; bom como fallback.
-    """
     try:
         pairs = dict(parse_qsl(s, keep_blank_values=False))
         return pairs or None
@@ -173,39 +171,38 @@ def parse_start_args(msg: types.Message) -> Dict[str, Any]:
     return {}
 
 # =============================
-# Construção do Lead enriquecido
+# Construção do Lead (enriquecido, sem “fake”)
 # =============================
 def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Dict[str, Any]:
     user_id = user.id
     now = int(time.time())
 
-    # Sinais FB (prioriza do Bridge)
+    # Sinais FB vindos do Bridge/Typebot
     fbclid = args.get("fbclid")
-    fbp = args.get("_fbp") or f"fb.1.{now}.{user_id}"
-    # fbc oficial quando há fbclid: fb.1.<ts>.<fbclid>
-    fbc = (
-        args.get("_fbc")
-        or (f"fb.1.{now}.{fbclid}" if fbclid else f"fb.1.{now}.tg.{user_id}")
-    )
+    fbp = args.get("_fbp")                       # NÃO inventa _fbp se não vier
+    # fbc real: _fbc do cookie OU “fb.1.<ts>.<fbclid>” somente se houver fbclid
+    fbc = args.get("_fbc") or (f"fb.1.{now}.{fbclid}" if fbclid else None)
 
-    # Não inventar IP/UA
+    # Não inventar IP/UA (só usa se vierem do Bridge)
     ip_from_bridge = args.get("ip")
     ua_from_bridge = args.get("user_agent")
 
-    # Fonte do evento
+    # event_source_url (fallback para o @username público do canal)
     event_source_url = (
         args.get("event_source_url")
         or args.get("landing_url")
         or (f"https://t.me/{VIP_PUBLIC_USERNAME}" if VIP_PUBLIC_USERNAME else None)
     )
 
-    # cookies (opcional, útil para auditoria interna)
-    cookies = {"_fbp": encrypt_data(fbp), "_fbc": encrypt_data(fbc)}
+    # cookies (apenas os que EXISTEM; sem “fake”)
+    cookies = {}
+    if fbp: cookies["_fbp"] = encrypt_data(fbp)
+    if fbc: cookies["_fbc"] = encrypt_data(fbc)
 
-    # Mapeia CEP/ZIP
+    # CEP/ZIP
     zip_code = args.get("zip") or args.get("postal_code") or args.get("cep")
 
-    # click_id (útil para dedupe e troubleshooting)
+    # click_id (útil para auditoria/dedupe)
     click_id = (
         args.get("click_id")
         or args.get("gclid")
@@ -214,9 +211,9 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         or fbclid
     )
 
-    # login_id / external_id (identidade de login no ecossistema)
-    login_id = args.get("login_id") or str(user_id)
-    external_id = args.get("external_id") or str(user_id)
+    # login_id / external_id (identidade de login); external_id = login_id (se vier) senão telegram_id
+    login_id = args.get("login_id")
+    external_id = args.get("external_id") or login_id or str(user_id)
 
     device_info = {
         "platform": "telegram",
@@ -227,7 +224,6 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         "url": event_source_url,
     }
 
-    # Monta lead base
     lead: Dict[str, Any] = {
         # chaves principais
         "telegram_id": user_id,
@@ -240,7 +236,7 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         "origin": "telegram",
         "event_type": "Lead",
 
-        # sinais técnicos
+        # sinais técnicos (somente se reais)
         "user_agent": ua_from_bridge or "TelegramBot/1.0",
         "ip": ip_from_bridge,
         "event_source_url": event_source_url,
@@ -249,7 +245,7 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         "click_id": click_id,
 
         # enrichment auxiliar
-        "cookies": cookies,
+        "cookies": cookies if cookies else None,
         "device_info": device_info,
         "session_metadata": {"msg_id": msg.message_id, "chat_id": msg.chat.id},
 
@@ -269,14 +265,15 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         "value": args.get("value") or 0,
         "currency": args.get("currency") or "BRL",
 
-        # Geo (pode vir do Bridge)
+        # Geo (se vier do bridge)
         "country": args.get("country"),
         "city": args.get("city"),
         "state": args.get("state"),
 
-        # espelha sinais para utils/FB CAPI (hashing)
+        # espelho para utils/CAPI (hashing lá dentro)
         "_fbp": fbp,
         "_fbc": fbc,
+
         "user_data": {
             "email": args.get("email"),
             "phone": args.get("phone"),
@@ -288,7 +285,7 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
             "country": args.get("country"),
             "telegram_id": str(user_id),
             "external_id": external_id,
-            "login_id": login_id,     # auditoria/identidade
+            "login_id": login_id,     # identificação de login (se existir)
             "fbp": fbp,
             "fbc": fbc,
             "ip": ip_from_bridge,
@@ -296,7 +293,7 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         }
     }
 
-    # event_id estável já no bot (mantém dedupe consistente na stack)
+    # event_id estável já no bot (mantém dedupe consistente em toda a stack)
     clamped = clamp_event_time(int(lead["event_time"]))
     lead["event_id"] = build_event_id("Lead", lead, clamped)
 
@@ -324,9 +321,7 @@ async def process_new_lead(msg: types.Message):
         if not redis_client.set(key, "1", nx=True, ex=LEAD_THROTTLE_SEC):
             START_THROTTLED.inc()
             logger.info(json.dumps({"event": "START_THROTTLED", "telegram_id": msg.from_user.id}))
-            # segue com retorno simples (não bloqueia fluxo do usuário)
             await msg.answer("⏳ Um instante… já estamos processando seu acesso.")
-            # não retorna aqui; deixa continuar para garantir experiência
 
     start_t = time.perf_counter()
     args = parse_start_args(msg)
@@ -338,8 +333,7 @@ async def process_new_lead(msg: types.Message):
     # gera link VIP (não bloqueia envio do evento)
     vip_link = await generate_vip_link(lead["event_key"])
 
-    # dispara o evento de forma assíncrona (Lead apenas)
-    # Subscribe automático acontecerá DENTRO do fb_google, se FB_AUTO_SUBSCRIBE_FROM_LEAD=1
+    # dispara o evento (Lead). Subscribe automático ocorre no fb_google se habilitado
     asyncio.create_task(send_event_with_retry("Lead", lead))
     LEADS_TRIGGERED.inc()
 
