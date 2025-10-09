@@ -2,8 +2,8 @@
 # retrofeed.py — v4.0 (payload completo + dedupe estável + modo direto/stream)
 # - NÃO cria _fbp/_fbc, IP ou UA (só repassa o que veio do DB/Bridge/Bot).
 # - Dedupe por event_id (get_or_build_event_id) com Redis SETNX+TTL + fallback em memória.
-# - Dois modos compatíveis:
-#     • RETROFEED_MODE=direct  -> envia aos pixels (FB/GA4) usando fb_google (idempotente).
+# - Dois modos:
+#     • RETROFEED_MODE=direct  -> envia aos pixels (FB/GA4) via fb_google (idempotente).
 #     • RETROFEED_MODE=stream  -> reempilha no Redis Stream para worker externo.
 # - Concurrency control (modo direto), retry com jitter, logs estruturados.
 # - Nenhuma ENV nova obrigatória (as extras são opcionais).
@@ -67,7 +67,7 @@ def _safe_dumps(obj: Any) -> str:
 
 def _coalesce_ids(lead: Dict[str, Any]) -> None:
     """
-    Garante telegram_id/external_id no topo e em user_data (espelhando o que já existe).
+    Garante telegram_id/external_id no topo e em user_data (espelha o que já existe).
     NÃO inventa dados além do espelhamento simples.
     """
     ud = lead.get("user_data") or {}
@@ -75,7 +75,6 @@ def _coalesce_ids(lead: Dict[str, Any]) -> None:
     if tg:
         lead["telegram_id"] = tg
         ud.setdefault("telegram_id", tg)
-        # external_id: preserva o existente; se não houver, cai para telegram_id
         ud.setdefault("external_id", ud.get("external_id") or tg)
         lead["user_data"] = ud
 
@@ -100,15 +99,15 @@ def _ensure_core_fields(lead: Dict[str, Any], default_event: str = "Lead") -> Di
     # IDs coerentes
     _coalesce_ids(l)
 
-    # event_id estável; se já veio, reaproveita; caso contrário gera determinístico
+    # event_id estável; se já veio, reaproveita; senão gera determinístico
     l["event_id"] = get_or_build_event_id(l["event_type"], l, l["event_time"])
     return l
 
 def _already_enqueued(event_id: str) -> bool:
     """
-    Dedupe simples via Redis SETNX+TTL + fallback memória.
-    True => já visto recentemente (pular).
-    False => ainda não visto (pode processar).
+    Dedupe via Redis SETNX+TTL + fallback memória.
+    True => já visto (pular).
+    False => ainda não visto (processar).
     """
     if not event_id:
         return False
@@ -126,7 +125,6 @@ def _already_enqueued(event_id: str) -> bool:
 
     # Memória (TTL simples)
     now = time.time()
-    # limpeza rápida
     expired = [k for k, exp in _mem_seen.items() if exp <= now]
     for k in expired:
         _mem_seen.pop(k, None)
@@ -181,7 +179,7 @@ async def _publish_stream(to_enqueue: List[Dict[str, Any]]) -> int:
 
 async def _send_one_direct(lead: Dict[str, Any]) -> Tuple[str, bool, Optional[str]]:
     """
-    Envia um lead diretamente para os pixels (FB/GA4) usando fb_google (que já é idempotente).
+    Envia um lead diretamente para os pixels (FB/GA4) via fb_google (idempotente).
     Retorna (event_id, ok, erro_str).
     """
     ev_id = str(lead.get("event_id") or "")
@@ -235,7 +233,7 @@ async def retrofeed(batch_size: int = BATCH_SIZE) -> int:
       - 'stream': reempilha no Redis Stream para worker externo.
     """
     init_db()
-    leads = await get_unsent_leads(limit=batch_size)  # já retorna LEAD completo (com event_id se disponível)
+    leads = await get_unsent_leads(limit=batch_size)  # payload completo (com event_id se disponível)
 
     if not leads:
         logger.info(_safe_dumps({"event": "RETROFEED_EMPTY"}))

@@ -1,11 +1,12 @@
-# utils.py — v3.3
-# (dedupe sólido; user_data avançado; sem dados fake)
-# - NÃO cria _fbp nem _fbc "do nada": só usa os que vierem do Bridge/Typebot.
+# utils.py — v4.0
+# (AM-friendly; dedupe sólido; user_data avançado; sem dados fake)
+# - NÃO cria _fbp/_fbc, IP ou UA "do nada".
 # - fbc só é derivado de fbclid se fbclid existir (fb.1.<ts>.<fbclid>).
 # - external_id prioriza login_id > external_id > telegram_id > user_id.
 # - CEP/ZIP normalizado por país (BR → apenas dígitos).
 # - event_id determinístico e estável em toda a stack.
-# - GA4 payload com UTM, device, clids e page_location; client_id consistente.
+# - ACTION_SOURCE: "chat" automaticamente quando plataforma=telegram; caso contrário, usa ENV sanitizado.
+# - GA4 payload com UTM, device, clids, page_location; client_id consistente.
 
 import os, re, time, hashlib
 from datetime import datetime, timedelta, timezone
@@ -16,7 +17,7 @@ from urllib.parse import urlparse
 # Config (reutiliza ENVs existentes; nada novo obrigatório)
 # ==============================
 DROP_OLD_DAYS = int(os.getenv("FB_DROP_OLDER_THAN_DAYS", "7"))   # janela máx aceita pelo FB
-ACTION_SOURCE = os.getenv("FB_ACTION_SOURCE", "website")         # sug.: "chat" p/ Telegram
+ACTION_SOURCE_ENV = os.getenv("FB_ACTION_SOURCE", "website")     # default quando NÃO for Telegram
 EVENT_ID_SALT = os.getenv("EVENT_ID_SALT", "change_me")
 
 SEND_LEAD_ON = (os.getenv("SEND_LEAD_ON", "botb") or "").lower()
@@ -49,14 +50,13 @@ def _to_int_ts(val: Optional[Any], default: Optional[int] = None) -> int:
     if val is None:
         return default if default is not None else now_ts()
     try:
-        if isinstance(val, (int,)):
+        if isinstance(val, int):
             return int(val)
         if isinstance(val, float):
             return int(val)
         s = str(val).strip()
         if not s:
             return default if default is not None else now_ts()
-        # suporta "1696000123" ou "1696000123.0"
         return int(float(s))
     except Exception:
         return default if default is not None else now_ts()
@@ -82,7 +82,7 @@ def _sanitize_action_source(src: str) -> str:
         "email", "physical_store", "system_generated", "other"
     }
     s = _norm(src)
-    return s if s in allowed else src
+    return s if s in allowed else "website"
 
 def _first_non_empty(*vals) -> Optional[str]:
     for v in vals:
@@ -283,6 +283,31 @@ def should_send_event(event_name: Optional[str]) -> bool:
     return event_name.lower() in ("lead", "subscribe")
 
 # ==============================
+# Action Source dinâmico (Telegram ⇒ chat)
+# ==============================
+def _detect_platform(lead: Dict[str, Any]) -> Optional[str]:
+    """
+    Detecta plataforma a partir de múltiplos pontos:
+    - lead.device_info.platform
+    - lead.platform
+    - lead.origin
+    """
+    di = lead.get("device_info") or {}
+    plat = _first_non_empty(
+        di.get("platform"),
+        lead.get("platform"),
+        lead.get("origin"),
+    )
+    return _norm(plat) if isinstance(plat, str) else None
+
+def _derive_action_source(lead: Dict[str, Any]) -> str:
+    plat = _detect_platform(lead)
+    if plat == "telegram":
+        return "chat"
+    # fallback: ENV (sanitizado)
+    return _sanitize_action_source(ACTION_SOURCE_ENV)
+
+# ==============================
 # Payload Facebook
 # ==============================
 def build_fb_payload(pixel_id: str, event_name: str, lead: Dict[str, Any]) -> Dict[str, Any]:
@@ -291,6 +316,7 @@ def build_fb_payload(pixel_id: str, event_name: str, lead: Dict[str, Any]) -> Di
     - event_time clampado
     - event_id estável (usa existente ou gera determinístico)
     - user_data normalizado (hash sensível; fbc só se real ou derivado de fbclid)
+    - action_source dinâmico (Telegram ⇒ "chat")
     - custom_data com UTM/device/geo/clids (campos livres para BI)
     """
     raw_time = _to_int_ts(lead.get("event_time"), default=now_ts())
@@ -345,7 +371,7 @@ def build_fb_payload(pixel_id: str, event_name: str, lead: Dict[str, Any]) -> Di
     )
     event_source_url = _url_or_none(event_source_url)
 
-    action_source = _sanitize_action_source(ACTION_SOURCE)
+    action_source = _derive_action_source(lead)
 
     return {
         "data": [{

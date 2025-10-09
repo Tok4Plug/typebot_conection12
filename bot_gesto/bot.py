@@ -1,11 +1,10 @@
 # bot.py — v4.0 (envio direto; AM-friendly; sem dados fake; dedupe estável)
-# - Parser de /start robusto: t_<token> (Redis), JSON inline, Base64URL (b64:...), e k=v&...
+# - Parser /start: t_<token> (Redis), JSON, Base64URL (b64:...), k=v&...
 # - Sinais reais: NÃO cria _fbp “do nada” e só deriva _fbc se houver fbclid.
-# - login_id → external_id (identidade de login); zip/cep; click_id; consent snapshot
-# - event_id calculado já no bot (mantém dedupe consistente em toda a stack)
-# - Sem IP/UA inventados (usa apenas os do bridge quando existirem; caso ausente, não envia)
-# - Logs estruturados + métricas Prometheus
-# - Nenhuma ENV nova obrigatória
+# - login_id → external_id; zip/cep; click_id; consent snapshot
+# - event_id calculado já no bot (dedupe consistente)
+# - Sem IP/UA inventados (usa apenas os do bridge; se ausente, não envia)
+# - Logs estruturados + métricas Prometheus; nenhuma ENV nova obrigatória
 
 import os, logging, json, asyncio, time, base64
 from datetime import datetime
@@ -21,7 +20,7 @@ from prometheus_client import Counter, Histogram
 # DB / Pixels / Utils
 # =============================
 from bot_gesto.db import save_lead, init_db, sync_pending_leads
-from bot_gesto.fb_google import send_event_with_retry  # envio direto, sem fila
+from bot_gesto.fb_google import send_event_with_retry
 from bot_gesto.utils import now_ts, clamp_event_time, build_event_id
 
 # =============================
@@ -49,7 +48,7 @@ logger.addHandler(ch)
 # ENV (nenhuma nova obrigatória)
 # =============================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-VIP_CHANNEL = os.getenv("VIP_CHANNEL")                  # chat_id numérico do canal VIP
+VIP_CHANNEL = os.getenv("VIP_CHANNEL")                   # chat_id numérico do canal VIP
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 SYNC_INTERVAL_SEC = int(os.getenv("SYNC_INTERVAL_SEC", "60"))
 BRIDGE_NS = os.getenv("BRIDGE_NS", "typebot")
@@ -106,15 +105,10 @@ async def generate_vip_link(event_key: str, member_limit=1, expire_hours=24) -> 
 # Parser de argumentos do /start
 # =============================
 def _try_parse_json(s: str) -> Optional[Dict[str, Any]]:
-    try:
-        return json.loads(s)
-    except Exception:
-        return None
+    try: return json.loads(s)
+    except Exception: return None
 
 def _try_parse_b64url(s: str) -> Optional[Dict[str, Any]]:
-    """
-    Aceita 'b64:<payload>' ou um blob base64url direto; tenta JSON primeiro, depois k=v&...
-    """
     raw = s[4:] if s.startswith("b64:") else s
     padding = '=' * (-len(raw) % 4)
     try:
@@ -171,7 +165,7 @@ def parse_start_args(msg: types.Message) -> Dict[str, Any]:
     return {}
 
 # =============================
-# Construção do Lead (enriquecido, sem “fake”)
+# Construção do Lead (sem “fake”)
 # =============================
 def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Dict[str, Any]:
     user_id = user.id
@@ -179,22 +173,22 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
 
     # Sinais FB vindos do Bridge/Typebot
     fbclid = args.get("fbclid")
-    fbp = args.get("_fbp")                       # NÃO inventa _fbp se não vier
-    # fbc real: _fbc do cookie OU “fb.1.<ts>.<fbclid>” somente se houver fbclid
+    fbp = args.get("_fbp")  # NÃO inventa _fbp se não vier
+    # _fbc real: do cookie OU "fb.1.<ts>.<fbclid>" somente se houver fbclid
     fbc = args.get("_fbc") or (f"fb.1.{now}.{fbclid}" if fbclid else None)
 
     # IP/UA: usa apenas se vierem do Bridge (sem default)
     ip_from_bridge = args.get("ip")
     ua_from_bridge = args.get("user_agent")
 
-    # event_source_url (fallback para o @username público do canal)
+    # event_source_url (fallback: @canal público se configurado)
     event_source_url = (
         args.get("event_source_url")
         or args.get("landing_url")
         or (f"https://t.me/{VIP_PUBLIC_USERNAME}" if VIP_PUBLIC_USERNAME else None)
     )
 
-    # cookies (apenas os que EXISTEM; sem “fake”)
+    # cookies (apenas os que EXISTEM)
     cookies = {}
     if fbp: cookies["_fbp"] = encrypt_data(fbp)
     if fbc: cookies["_fbc"] = encrypt_data(fbc)
@@ -202,7 +196,7 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
     # CEP/ZIP
     zip_code = args.get("zip") or args.get("postal_code") or args.get("cep")
 
-    # click_id (útil para auditoria/dedupe)
+    # click_id (auditoria/dedupe)
     click_id = (
         args.get("click_id")
         or args.get("gclid")
@@ -211,11 +205,11 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         or fbclid
     )
 
-    # login_id / external_id (identidade de login); external_id = login_id (se vier) senão telegram_id
+    # login_id / external_id
     login_id = args.get("login_id")
     external_id = args.get("external_id") or login_id or str(user_id)
 
-    # consent snapshot (opcional, vindo do bridge)
+    # consent snapshot (opcional, vindo do Bridge)
     consent = args.get("consent") if isinstance(args.get("consent"), dict) else None
 
     device_info = {
@@ -240,9 +234,8 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         "event_type": "Lead",
 
         # sinais técnicos (somente se reais)
-        # IMPORTANTE: não inventamos UA/IP; só repassamos se existirem
-        "user_agent": ua_from_bridge,
-        "ip": ip_from_bridge,
+        "user_agent": ua_from_bridge,   # se None, não enviamos UA
+        "ip": ip_from_bridge,           # se None, não enviamos IP
         "event_source_url": event_source_url,
         "event_time": now_ts(),
         "event_key": f"tg-{user_id}-{now}",
@@ -253,10 +246,10 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         "device_info": device_info,
         "session_metadata": {"msg_id": msg.message_id, "chat_id": msg.chat.id},
 
-        # UTM e clids
-        "utm_source": args.get("utm_source") or "telegram",
-        "utm_medium": args.get("utm_medium") or "botb",
-        "utm_campaign": args.get("utm_campaign") or "vip_access",
+        # UTM e clids (sem defaults; só repassa se existir)
+        "utm_source": args.get("utm_source"),
+        "utm_medium": args.get("utm_medium"),
+        "utm_campaign": args.get("utm_campaign"),
         "utm_term": args.get("utm_term"),
         "utm_content": args.get("utm_content"),
 
@@ -278,7 +271,7 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         "_fbp": fbp,
         "_fbc": fbc,
 
-        # custom_data pré-existente (para preservarmos consent e outras flags)
+        # custom_data p/ manter consent/flags
         "custom_data": {"consent": consent} if consent else None,
 
         "user_data": {
@@ -292,7 +285,7 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
             "country": args.get("country"),
             "telegram_id": str(user_id),
             "external_id": external_id,
-            "login_id": login_id,     # identificação de login (se existir)
+            "login_id": login_id,
             "fbp": fbp,
             "fbc": fbc,
             "ip": ip_from_bridge,
@@ -300,7 +293,7 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         }
     }
 
-    # event_id estável já no bot (mantém dedupe consistente em toda a stack)
+    # event_id estável já no bot
     clamped = clamp_event_time(int(lead["event_time"]))
     lead["event_id"] = build_event_id("Lead", lead, clamped)
 

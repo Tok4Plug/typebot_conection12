@@ -6,6 +6,7 @@
 # - Histórico consistente: [{event_type,event_id,event_time,status,ts,delivery,am}].
 # - Payload completo no sync/retrofeed (inclui event_id), sem fabricar cookies.
 # - Criptografia de cookies (Fernet ou base64).
+# - Índices opcionais (Postgres) para performance.
 # - Sem ENVs novos obrigatórios.
 
 import os, asyncio, json, time, hashlib, base64, logging
@@ -23,6 +24,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import SQLAlchemyError, OperationalError
+from sqlalchemy import text as _sql_text
 
 # ==============================
 # Logging
@@ -108,7 +110,7 @@ class Lead(Base):
     event_key = Column(String(128), unique=True, nullable=False, index=True)
     telegram_id = Column(String(128), index=True, nullable=False)
 
-    event_type = Column(String(50), index=True)   # "Lead" principal, "Subscribe" apenas histórico
+    event_type = Column(String(50), index=True)   # "Lead" principal; "Subscribe" apenas histórico
     route_key = Column(String(50), index=True)    # ex.: "botb", "vip"
 
     src_url = Column(Text, nullable=True)
@@ -131,13 +133,32 @@ class Lead(Base):
     last_sent_at = Column(DateTime(timezone=True), nullable=True)
 
 # ==============================
-# Init
+# Init + Índices opcionais
 # ==============================
+def _ensure_indexes():
+    """Cria índices opcionais (PostgreSQL) para melhorar consultas críticas."""
+    if not engine or engine.dialect.name != "postgresql":
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(_sql_text(
+                "CREATE INDEX IF NOT EXISTS idx_leads_telegram_created "
+                "ON leads (telegram_id, created_at DESC)"
+            ))
+            conn.execute(_sql_text(
+                "CREATE INDEX IF NOT EXISTS idx_leads_sent_false "
+                "ON leads (created_at) WHERE sent = false"
+            ))
+        logger.info("🗃️ Índices opcionais verificados/criados (PostgreSQL).")
+    except Exception as e:
+        logger.warning(f"⚠️ Falha ao criar índices opcionais: {e}")
+
 def init_db():
     if not engine:
         return
     try:
         Base.metadata.create_all(bind=engine)
+        _ensure_indexes()
         logger.info("✅ DB inicializado e tabelas sincronizadas")
     except SQLAlchemyError as e:
         logger.error(f"Erro init DB: {e}")
@@ -196,9 +217,7 @@ def _mirror_into_custom(data: Dict[str, Any]) -> Dict[str, Any]:
     return base
 
 def _best_src_url(data: Dict[str, Any]) -> Optional[str]:
-    """
-    Resolve melhor origem de URL: event_source_url > src_url > landing_url > device_info.url.
-    """
+    """Resolve melhor origem de URL: event_source_url > src_url > landing_url > device_info.url."""
     di = data.get("device_info") or {}
     return (
         data.get("event_source_url")
@@ -234,10 +253,7 @@ def _latest_event_id(row: Lead) -> Optional[str]:
 # Advanced Matching coverage (snapshot por evento)
 # ------------------------------
 def _am_coverage_from_lead(lead: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Calcula cobertura de Advanced Matching a partir do lead (sem logar dados sensíveis).
-    Usa utils.normalize_user_data para obter o mapa final de user_data (hash/direct).
-    """
+    """Calcula cobertura de AM (sem logar dados sensíveis)."""
     ud = utils.normalize_user_data(lead.get("user_data") or lead) or {}
     hashed_keys = ["em", "ph", "fn", "ln", "ct", "st", "country", "zp", "external_id"]
     direct_keys = ["fbp", "fbc", "client_ip_address", "client_user_agent"]
@@ -265,10 +281,7 @@ def _am_coverage_from_lead(lead: Dict[str, Any]) -> Dict[str, Any]:
 # Compactação de resultados de entrega (FB/GA4)
 # ------------------------------
 def _compact_result(res: Any) -> Dict[str, Any]:
-    """
-    Mantém apenas metadados de entrega não sensíveis.
-    Extrai 'events_received' e 'fbtrace_id' quando possível (FB).
-    """
+    """Mantém metadados de entrega não sensíveis."""
     if not isinstance(res, dict):
         return {"ok": False}
     out = {
@@ -311,7 +324,6 @@ def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
     cookies = _safe_dict(row.cookies or {}, decrypt=True)
     di = row.device_info or {}
 
-    # NÃO criar fbp/fbc; apenas utilizar os existentes
     _fbp = custom.get("_fbp") or user.get("fbp")
     _fbc = custom.get("_fbc") or user.get("fbc")
 
@@ -323,14 +335,10 @@ def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
         "event_type": row.event_type or "Lead",
         "event_time": event_time,
 
-        # valores de negócio
         "value": row.value,
         "currency": row.currency,
 
-        # cookies descriptografados (auditoria interna)
         "cookies": cookies,
-
-        # device_info íntegro
         "device_info": {
             "platform": di.get("platform"),
             "app": di.get("app"),
@@ -339,8 +347,6 @@ def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
             "browser": di.get("browser") or custom.get("browser"),
             "url": di.get("url") or custom.get("event_source_url") or custom.get("landing_url"),
         },
-
-        # session
         "session_metadata": row.session_metadata or {},
 
         # URLs/UTMs
@@ -395,6 +401,13 @@ def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
         "ip": user.get("ip"),
         "ua": user.get("ua"),
         "login_id": user.get("login_id") or custom.get("login_id"),
+
+        # mantemos username/premium se salvos no lead
+        "username": user.get("username"),
+        "premium": user.get("premium"),
+        "first_name_top": user.get("first_name_top"),
+        "last_name_top": user.get("last_name_top"),
+        "lang": user.get("lang"),
     }
 
     # user_agent no topo (qualifica parsers a jusante)
@@ -414,13 +427,17 @@ def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
     return lead
 
 # ==============================
-# Priority Score (opcional)
+# Priority Score (robusto p/ username/premium)
 # ==============================
 def compute_priority_score(user_data: Dict[str, Any], custom_data: Dict[str, Any]) -> float:
+    """
+    Pontuação simples para priorização de envios.
+    Lê username/premium do user_data (que agora recebe esses campos no save_lead).
+    """
     score = 0.0
     if user_data.get("username"): score += 2
-    if user_data.get("first_name"): score += 1
-    if user_data.get("premium"): score += 3
+    if user_data.get("first_name") or user_data.get("first_name_top"): score += 1
+    if user_data.get("premium") is True: score += 3
     if user_data.get("country"): score += 1
     if user_data.get("external_id"): score += 2
     try:
@@ -438,6 +455,7 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
     - NÃO cria _fbp/_fbc/IP/UA — só persiste o que veio.
     - Espelha UTMs/CLIDs/GEO/URL/Device/IDs em custom_data.
     - Guarda histórico {event_type,event_id,event_time,status,ts} sem duplicar event_id.
+    - Garante user_data com username/premium vindos do topo (para compute_priority_score).
     """
     if not SessionLocal:
         logger.warning("DB desativado - save_lead ignorado")
@@ -464,11 +482,26 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
                 # event_key (fallback determinístico se não vier)
                 ek = data.get("event_key") or f"tg-{telegram_id}-{event_time}"
 
+                # user_data normalizado + inclusão de username/premium do topo
+                normalized_ud = dict(data.get("user_data") or {})
+                # campos do topo que queremos garantir no user_data:
+                for k_top, k_ud in [
+                    ("username", "username"),
+                    ("premium", "premium"),
+                    ("first_name", "first_name_top"),
+                    ("last_name", "last_name_top"),
+                    ("lang", "lang"),
+                ]:
+                    v = data.get(k_top)
+                    if v not in (None, "") and normalized_ud.get(k_ud) in (None, ""):
+                        normalized_ud[k_ud] = v
+                # garante telegram_id
+                normalized_ud.setdefault("telegram_id", telegram_id)
+
                 # espelhamento para custom_data (somente sinais reais)
                 custom = _mirror_into_custom(data)
 
                 # prioridade opcional
-                normalized_ud = data.get("user_data") or {"telegram_id": telegram_id}
                 custom["priority_score"] = compute_priority_score(normalized_ud, custom)
 
                 # cifrar cookies (se vierem)
@@ -728,7 +761,6 @@ async def sync_pending_leads(batch_size: int = 20) -> int:
                     processed += 1
                     continue
 
-                # Atualiza flags e timestamps
                 now_iso = datetime.now(timezone.utc).isoformat()
                 if ok:
                     obj.sent = True
@@ -736,8 +768,7 @@ async def sync_pending_leads(batch_size: int = 20) -> int:
                 else:
                     obj.last_attempt_at = datetime.now(timezone.utc)
 
-                # Enriquecer histórico: marca o último event_id usado
-                # (igual ao de lead_payload) com status e telemetria
+                # marca histórico coerente
                 ev_id = lead_payload.get("event_id")
                 eh = obj.event_history or []
                 if ev_id:
@@ -751,7 +782,6 @@ async def sync_pending_leads(batch_size: int = 20) -> int:
                             updated = True
                             break
                     if not updated:
-                        # Se por algum motivo não existir, criamos um registro coerente
                         eh.append({
                             "event_type": lead_payload.get("event_type") or "Lead",
                             "event_id": ev_id,

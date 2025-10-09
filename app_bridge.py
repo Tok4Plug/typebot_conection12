@@ -356,7 +356,7 @@ class TBPayload(BaseModel):
     extra: Optional[Dict[str, Any]] = None
 
 # =============================
-# Helpers
+# Helpers (auth, tokens, consent)
 # =============================
 def _make_token(n: int = 16) -> str:
     return secrets.token_urlsafe(n)
@@ -407,11 +407,12 @@ def _parse_cookies(header_cookie: Optional[str]) -> Dict[str, Any]:
         for pair in header_cookie.split(";"):
             if "=" in pair:
                 k, v = pair.split("=", 1)
+                out[k].strip()  # just to ensure exists
                 out[k.strip()] = v.strip()
     except Exception:
         pass
 
-    # Hints úteis
+    # Hints úteis (_ga → cid_hint)
     ga = out.get("_ga")
     if ga and "GA" in ga and not out.get("cid"):
         try:
@@ -421,7 +422,7 @@ def _parse_cookies(header_cookie: Optional[str]) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # GCLID de cookies do Google (às vezes em _gcl_*)
+    # GCLID em _gcl_*
     if not out.get("gclid"):
         for k in ("_gcl_au", "_gcl_aw", "_gcl_dc"):
             g = out.get(k)
@@ -434,7 +435,7 @@ def _parse_cookies(header_cookie: Optional[str]) -> Dict[str, Any]:
                 except Exception:
                     pass
 
-    # login id em cookie (se sua página setar)
+    # login id em cookie (se a página setar)
     for lk in ("login_id", "uid", "user_id"):
         if out.get(lk) and not out.get("login_id"):
             out["login_id"] = out[lk]
@@ -483,7 +484,7 @@ def _enrich_payload(data: dict, req: Request) -> dict:
     """
     data = dict(data or {})
 
-    # Event source url: privilegia body; senão Referer
+    # event_source_url: body > Referer
     referer = req.headers.get("Referer") or req.headers.get("referer")
     if not data.get("event_source_url") and referer:
         data["event_source_url"] = referer
@@ -499,14 +500,13 @@ def _enrich_payload(data: dict, req: Request) -> dict:
     if ck.get("gclid_hint") and not data.get("gclid"):
         data["gclid"] = ck["gclid_hint"]
 
-    # fbc a partir de fbclid (permitido e recomendado pela Meta)
+    # _fbc a partir de fbclid (permitido e recomendado pela Meta)
     if data.get("fbclid") and not data.get("_fbc"):
         data["_fbc"] = f"fb.1.{int(time.time())}.{data['fbclid']}"
 
-    # NÃO criar _fbp se ausente (sem dados fake)
-    # Apenas se já houver via cookie/body, mantemos.
+    # NÃO criar _fbp se ausente
 
-    # Também espelha em 'fbc'/'fbp' limpos, mas só se já existirem
+    # Também espelha 'fbc'/'fbp' limpos, mas só se existirem
     if data.get("_fbc") and not data.get("fbc"):
         data["fbc"] = data["_fbc"]
     if data.get("_fbp") and not data.get("fbp"):
@@ -532,7 +532,7 @@ def _enrich_payload(data: dict, req: Request) -> dict:
         data.setdefault("user_agent", ua_info.get("ua"))
         _merge_if_empty(data, ua_info, ["device", "os", "browser"])
 
-    # login_id via header/querystring (se enviado pelo front)
+    # login_id de header/QS
     hdr_login = req.headers.get("X-Login-Id") or req.headers.get("x-login-id")
     if hdr_login and not data.get("login_id"):
         data["login_id"] = hdr_login
@@ -540,11 +540,11 @@ def _enrich_payload(data: dict, req: Request) -> dict:
     if qs.get("login_id") and not data.get("login_id"):
         data["login_id"] = qs.get("login_id")
 
-    # external_id: se não vier, herda login_id (prioridade utils: login_id > external_id > telegram_id)
+    # external_id: herda login_id quando ausente
     if data.get("login_id") and not data.get("external_id"):
         data["external_id"] = data["login_id"]
 
-    # consent snapshot (captura apenas)
+    # consent snapshot
     data["consent"] = _extract_consent(req, data)
 
     # timestamp de recepção
@@ -558,7 +558,6 @@ def _enrich_payload(data: dict, req: Request) -> dict:
         except Exception as e:
             logger.warning(f"⚠️ Encryption failed: {e}")
 
-    # LOG DO ENRIQUECIMENTO
     logger.info(json.dumps({
         "event": "ENRICH_OK",
         "ip": data.get("ip"),
@@ -581,7 +580,7 @@ async def _maybe_async(fn, *args, **kwargs):
     return res
 
 # =============================
-# App & Rotas
+# Rotas
 # =============================
 @app.get("/health")
 def health():
@@ -599,15 +598,6 @@ def health():
 @app.options("/{full_path:path}")
 async def options_ok(full_path: str):
     return {}
-
-def _make_token(n: int = 16) -> str:
-    return secrets.token_urlsafe(n)
-
-def _key(token: str) -> str:
-    return f"typebot:{token}"
-
-def _deep_link(token: str) -> str:
-    return f"https://t.me/{BOT_USERNAME}?start=t_{token}"
 
 @app.post("/tb/link")
 async def create_deeplink(
@@ -659,7 +649,7 @@ async def ingest_event(
     _auth_guard(x_api_key, x_bridge_token, authorization)
     data = _enrich_payload(body.dict(exclude_none=True), req)
 
-    # Persistência + envio (assíncronos e desacoplados)
+    # Persistência + envio (assíncronos)
     asyncio.create_task(_maybe_async(save_lead, data))
     asyncio.create_task(_maybe_async(send_event_to_all, data, et=event_type or "Lead"))
 
@@ -714,8 +704,6 @@ async def apply_redirect(req: Request):
     um deep link Telegram com token efêmero no Redis.
     """
     base_payload: Dict[str, Any] = {"source": "apply"}
-
-    # Espelha QS de forma segura (sem sobrescrever campos já presentes)
     try:
         if req.query_params:
             base_payload["qs"] = dict(req.query_params)
