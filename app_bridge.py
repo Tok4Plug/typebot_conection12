@@ -1,5 +1,5 @@
 # =============================
-# app_bridge.py — v3.3 (Bridge com enriquecimento + login_id + logs claros)
+# app_bridge.py — v4.0 (Bridge first-party, AM-friendly, sem dados fake)
 # =============================
 import os, sys, json, time, secrets, logging, asyncio, base64, hashlib, importlib.util
 from typing import Optional, Dict, Any, List, Tuple
@@ -23,7 +23,7 @@ class JSONFormatter(logging.Formatter):
         }
         if record.exc_info:
             log["exc_info"] = self.formatException(record.exc_info)
-        return json.dumps(log)
+        return json.dumps(log, ensure_ascii=False)
 
 logger = logging.getLogger("bridge")
 logger.setLevel(logging.INFO)
@@ -205,6 +205,9 @@ PORT            = int(os.getenv("PORT", "8080"))
 GEOIP_DB_PATH   = os.getenv("GEOIP_DB_PATH", "")
 USE_USER_AGENTS = os.getenv("USE_USER_AGENTS", "1") == "1"
 
+# Consent (captura apenas; decisão de uso fica a jusante)
+CONSENT_HEADER_KEYS = [h.strip() for h in (os.getenv("CONSENT_HEADER_KEYS", "X-Consent,X-TCF-String,TCF-String,GDPR-Consent") or "").split(",") if h.strip()]
+
 # Crypto
 CRYPTO_KEY = os.getenv("CRYPTO_KEY")
 fernet = None
@@ -287,7 +290,7 @@ def parse_ua(ua: Optional[str]) -> Dict[str, Any]:
 # =============================
 # App FastAPI
 # =============================
-app = FastAPI(title="Typebot Bridge", version="3.3")
+app = FastAPI(title="Typebot Bridge", version="4.0")
 if ALLOWED_ORIGINS:
     app.add_middleware(
         CORSMiddleware,
@@ -298,7 +301,7 @@ if ALLOWED_ORIGINS:
     )
 
 # =============================
-# Schemas (mantendo compat + extras úteis)
+# Schemas (compat + sinais AM)
 # =============================
 class TBPayload(BaseModel):
     # IDs/cookies/click-ids
@@ -326,7 +329,7 @@ class TBPayload(BaseModel):
     browser: Optional[str] = None
     platform: Optional[str] = None
 
-    # User fields
+    # User fields (não inventamos nada)
     email: Optional[str] = None
     phone: Optional[str] = None
     first_name: Optional[str] = None
@@ -343,7 +346,10 @@ class TBPayload(BaseModel):
     # IDs de usuário
     telegram_id: Optional[str] = None
     external_id: Optional[str] = None
-    login_id: Optional[str] = None  # <- suporte a identificação de login
+    login_id: Optional[str] = None  # identificação de login
+
+    # Consent (captura; uso a jusante)
+    consent: Optional[Dict[str, Any]] = None
 
     # Controle
     event: Optional[str] = None
@@ -383,10 +389,7 @@ def _auth_guard(
     bearer = _parse_authorization(authorization)
     supplied = x_api_key or x_bridge_token or bearer
     if supplied != expected:
-        logger.warning(json.dumps({
-            "event": "AUTH_FAIL",
-            "reason": "token_mismatch",
-        }))
+        logger.warning(json.dumps({"event": "AUTH_FAIL", "reason": "token_mismatch"}))
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 def _extract_client_ip(req: Request) -> Optional[str]:
@@ -418,12 +421,11 @@ def _parse_cookies(header_cookie: Optional[str]) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # GCLID de cookies do Google (às vezes aparece em _gcl_au/aw)
+    # GCLID de cookies do Google (às vezes em _gcl_*)
     if not out.get("gclid"):
-        for k in ("_gcl_au", "_gcl_aw"):
+        for k in ("_gcl_au", "_gcl_aw", "_gcl_dc"):
             g = out.get(k)
             if g and "." in g:
-                # formatos variam; tentamos pegar o último segmento alfanumérico longo
                 try:
                     segs = [s for s in g.split(".") if len(s) >= 8]
                     if segs:
@@ -445,48 +447,76 @@ def _merge_if_empty(dst: Dict[str, Any], src: Dict[str, Any], keys: List[str]) -
         if v is not None and (dst.get(k) in (None, "")):
             dst[k] = v
 
+def _extract_consent(req: Request, data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Captura sinais de consentimento (quando existirem).
+    Não bloqueia envio aqui; apenas anexa ao payload para decisão a jusante.
+    """
+    consent: Dict[str, Any] = dict(data.get("consent") or {})
+    # Header TCF/consent
+    for hk in CONSENT_HEADER_KEYS:
+        hv = req.headers.get(hk)
+        if hv and not consent.get(hk):
+            consent[hk] = hv
+    # Cookies comuns (IAB/OneTrust/etc.)
+    ck = _parse_cookies(req.headers.get("cookie"))
+    for ck_key in ("euconsent-v2", "OptanonConsent", "CookieConsent", "CONSENT"):
+        if ck.get(ck_key) and not consent.get(ck_key):
+            consent[ck_key] = ck.get(ck_key)
+    # DNT (Do Not Track)
+    dnt = req.headers.get("DNT") or req.headers.get("dnt")
+    if dnt is not None and consent.get("dnt") is None:
+        consent["dnt"] = dnt
+    return consent
+
 def _enrich_payload(data: dict, req: Request) -> dict:
     """
-    Enriquecimento do bridge (first-party):
-    - IP real + Geo
-    - UA -> device/os/browser
-    - _fbp/_fbc coerentes (se já tem, preserva)
+    Enriquecimento first-party (sem dados fake):
+    - IP real + Geo (quando disponível)
+    - UA -> device/os/browser (derivado do UA real)
+    - NUNCA cria _fbp; apenas repassa o que vier (cookies/body)
+    - _fbc só é derivado se HOUVER fbclid
     - cid/cid_hint/gclid_hint
-    - login_id / external_id (se vierem)
-    - NÃO inventa e-mail/telefone/zip; apenas propaga se vierem
+    - login_id de header/QS/cookies; external_id herda de login_id quando ausente
+    - event_source_url do body ou Referer (não forçamos)
+    - consent capturado (decisão de uso fica a jusante)
     """
-    # Deep copy leve
     data = dict(data or {})
+
+    # Event source url: privilegia body; senão Referer
+    referer = req.headers.get("Referer") or req.headers.get("referer")
+    if not data.get("event_source_url") and referer:
+        data["event_source_url"] = referer
+
     ip = _extract_client_ip(req)
     ua = data.get("user_agent") or req.headers.get("user-agent")
     ck = _parse_cookies(req.headers.get("cookie"))
 
-    # Espelhar hints de cookies para o corpo (sem sobrescrever)
+    # Espelhar cookies -> corpo (sem sobrescrever)
     _merge_if_empty(data, ck, ["_fbp", "_fbc", "cid", "login_id"])
     if ck.get("cid_hint") and not data.get("cid"):
         data["cid"] = ck["cid_hint"]
     if ck.get("gclid_hint") and not data.get("gclid"):
         data["gclid"] = ck["gclid_hint"]
 
-    # fbc a partir de fbclid (se não vier pronto)
+    # fbc a partir de fbclid (permitido e recomendado pela Meta)
     if data.get("fbclid") and not data.get("_fbc"):
         data["_fbc"] = f"fb.1.{int(time.time())}.{data['fbclid']}"
 
-    # Garante fbp se ausente (first-party)
-    if not data.get("_fbp"):
-        data["_fbp"] = f"fb.1.{int(time.time())}.{secrets.randbelow(999_999_999)}"
+    # NÃO criar _fbp se ausente (sem dados fake)
+    # Apenas se já houver via cookie/body, mantemos.
 
-    # Também espelha em 'fbc'/'fbp' "limpos" (alguns pipelines consomem essas chaves)
+    # Também espelha em 'fbc'/'fbp' limpos, mas só se já existirem
     if data.get("_fbc") and not data.get("fbc"):
         data["fbc"] = data["_fbc"]
     if data.get("_fbp") and not data.get("fbp"):
         data["fbp"] = data["_fbp"]
 
-    # CID fallback (Measurement Protocol)
+    # CID fallback (Measurement Protocol), opcional
     if not data.get("cid") and data.get("gclid"):
         data["cid"] = f"gclid.{data['gclid']}"
 
-    # IP/Geo
+    # IP/Geo (reais)
     if ip:
         data.setdefault("ip", ip)
         geo = geo_lookup(ip)
@@ -496,7 +526,7 @@ def _enrich_payload(data: dict, req: Request) -> dict:
             data.setdefault("city", data.get("city") or geo.get("city"))
             data.setdefault("state", data.get("state") or geo.get("region"))
 
-    # UA/Device
+    # UA/Device (reais)
     ua_info = parse_ua(ua)
     if ua_info:
         data.setdefault("user_agent", ua_info.get("ua"))
@@ -510,9 +540,12 @@ def _enrich_payload(data: dict, req: Request) -> dict:
     if qs.get("login_id") and not data.get("login_id"):
         data["login_id"] = qs.get("login_id")
 
-    # external_id: se front mandar, preserva; senão, usa login_id como dica
+    # external_id: se não vier, herda login_id (prioridade utils: login_id > external_id > telegram_id)
     if data.get("login_id") and not data.get("external_id"):
         data["external_id"] = data["login_id"]
+
+    # consent snapshot (captura apenas)
+    data["consent"] = _extract_consent(req, data)
 
     # timestamp de recepção
     data.setdefault("ts", int(time.time()))
@@ -529,10 +562,14 @@ def _enrich_payload(data: dict, req: Request) -> dict:
     logger.info(json.dumps({
         "event": "ENRICH_OK",
         "ip": data.get("ip"),
-        "geo": data.get("geo"),
+        "has_fbp": bool(data.get("_fbp") or data.get("fbp")),
+        "has_fbc": bool(data.get("_fbc") or data.get("fbc")),
+        "has_fbclid": bool(data.get("fbclid")),
+        "has_gclid": bool(data.get("gclid")),
         "device": data.get("device"),
         "os": data.get("os"),
         "browser": data.get("browser"),
+        "consent_keys": list((data.get("consent") or {}).keys()) if data.get("consent") else [],
     }))
 
     return data
@@ -546,17 +583,6 @@ async def _maybe_async(fn, *args, **kwargs):
 # =============================
 # App & Rotas
 # =============================
-app = FastAPI(title="Typebot Bridge", version="3.3")
-
-if ALLOWED_ORIGINS:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=ALLOWED_ORIGINS,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
 @app.get("/health")
 def health():
     try:
@@ -573,6 +599,15 @@ def health():
 @app.options("/{full_path:path}")
 async def options_ok(full_path: str):
     return {}
+
+def _make_token(n: int = 16) -> str:
+    return secrets.token_urlsafe(n)
+
+def _key(token: str) -> str:
+    return f"typebot:{token}"
+
+def _deep_link(token: str) -> str:
+    return f"https://t.me/{BOT_USERNAME}?start=t_{token}"
 
 @app.post("/tb/link")
 async def create_deeplink(
@@ -632,6 +667,8 @@ async def ingest_event(
         "event": "EVENT_SENT",
         "type": event_type or "Lead",
         "telegram_id": data.get("telegram_id"),
+        "has_fbp": bool(data.get("_fbp") or data.get("fbp")),
+        "has_fbc": bool(data.get("_fbc") or data.get("fbc")),
     }))
 
     return {"status": "ok", "saved": True, "events": [event_type or "Lead"]}
@@ -677,14 +714,15 @@ async def apply_redirect(req: Request):
     um deep link Telegram com token efêmero no Redis.
     """
     base_payload: Dict[str, Any] = {"source": "apply"}
+
+    # Espelha QS de forma segura (sem sobrescrever campos já presentes)
     try:
         if req.query_params:
             base_payload["qs"] = dict(req.query_params)
-            # espelha campos comuns da QS no payload raiz (sem sobrescrever)
             for k in (
                 "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
                 "gclid", "gbraid", "wbraid", "fbclid", "cid", "city", "state", "zip", "country",
-                "login_id", "external_id", "email"
+                "login_id", "external_id", "email", "phone", "event_source_url"
             ):
                 if k in req.query_params and base_payload.get(k) in (None, ""):
                     base_payload[k] = req.query_params.get(k)
@@ -699,7 +737,9 @@ async def apply_redirect(req: Request):
         "event": "APPLY_REDIRECT",
         "token": token,
         "ip": data.get("ip"),
-        "geo": data.get("geo")
+        "geo": data.get("geo"),
+        "has_fbp": bool(data.get("_fbp") or data.get("fbp")),
+        "has_fbc": bool(data.get("_fbc") or data.get("fbc")),
     }))
 
     return RedirectResponse(url=_deep_link(token))

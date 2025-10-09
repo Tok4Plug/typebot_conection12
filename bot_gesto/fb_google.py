@@ -1,10 +1,11 @@
-# fb_google.py — v3.3 (envio direto; idempotência estável; sem dados fake)
-# - NÃO inventa _fbp/_fbc, IP ou UA (apenas repassa os sinais reais vindos do Bridge/Typebot/bot).
-# - Dedupe usa get_or_build_event_id => estável entre envio imediato e reprocesso (sync_pending/retrofeed).
+# fb_google.py — v4.0
+# (envio direto; idempotência estável; AM coverage logs; sem dados fake)
+# - NÃO inventa _fbp/_fbc, IP ou UA (só repassa sinais reais do Bridge/Typebot/Bot).
+# - Dedupe usa get_or_build_event_id (estável entre envio imediato e reprocesso).
 # - Retry exponencial + jitter; timeouts configuráveis.
 # - Auto-Subscribe opcional quando evento principal é Lead.
 # - GA4 opcional (Measurement Protocol), com modo debug opcional.
-# - Logs estruturados, sem vazar segredos.
+# - Logs estruturados, sem vazar segredos, incluindo cobertura de Advanced Matching.
 
 import os, aiohttp, asyncio, json, logging, random, time
 from typing import Dict, Any, Optional
@@ -139,7 +140,7 @@ def _event_dedupe_key(event_name: str, lead: Dict[str, Any]) -> str:
     Chave determinística compatível com dedupe por event_id e com toda a stack.
     Usa get_or_build_event_id para respeitar event_id já definido no lead.
     """
-    ts = clamp_event_time(int(lead.get("event_time") or time.time()))
+    ts = clamp_event_time(lead.get("event_time"))
     eid = get_or_build_event_id(event_name, lead, ts)
     return f"{event_name.lower()}:{eid}"
 
@@ -173,6 +174,39 @@ def _dedupe_check_and_mark(event_name: str, lead: Dict[str, Any]) -> bool:
         return False
     _mem_dedupe[key] = now + FB_DEDUP_TTL_SEC
     return True
+
+def _advanced_matching_coverage(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Mede cobertura de Advanced Matching (para diagnóstico/score).
+    NÃO loga valores sensíveis; apenas presença de campos.
+    """
+    try:
+        d0 = (payload.get("data") or [{}])[0]
+        ud = d0.get("user_data") or {}
+    except Exception:
+        ud = {}
+
+    hashed_keys = ["em", "ph", "fn", "ln", "ct", "st", "country", "zp", "external_id"]
+    direct_keys = ["fbp", "fbc", "client_ip_address", "client_user_agent"]
+
+    present_hashed = [k for k in hashed_keys if k in ud and ud.get(k)]
+    present_direct = [k for k in direct_keys if k in ud and ud.get(k)]
+    missing_hashed = [k for k in hashed_keys if k not in present_hashed]
+    missing_direct = [k for k in direct_keys if k not in present_direct]
+
+    total = len(hashed_keys) + len(direct_keys)
+    present_total = len(present_hashed) + len(present_direct)
+    coverage = round(100.0 * present_total / total, 2)
+
+    return {
+        "coverage_pct": coverage,
+        "present_hashed": present_hashed,
+        "present_direct": present_direct,
+        "missing_hashed": missing_hashed,
+        "missing_direct": missing_direct,
+        "total_fields": total,
+        "present_total": present_total
+    }
 
 async def _post_with_retry(
     url: str,
@@ -260,6 +294,9 @@ async def send_event_fb(event_name: str, lead: Dict[str, Any]) -> Dict[str, Any]
     coerced = _coerce_lead(lead)  # sem inventar dados
     payload = build_fb_payload(FB_PIXEL_ID, event_name, coerced)
 
+    # Telemetria de cobertura de AM (para diagnóstico do "score")
+    am = _advanced_matching_coverage(payload)
+
     res = await _post_with_retry(url, payload, retries=FB_RETRY_MAX, platform="facebook", et=event_name)
     logger.info(json.dumps({
         "event": "FB_SEND",
@@ -267,7 +304,12 @@ async def send_event_fb(event_name: str, lead: Dict[str, Any]) -> Dict[str, Any]
         "telegram_id": coerced.get("telegram_id"),
         "status": res.get("status"),
         "ok": res.get("ok"),
-        "error": res.get("error")
+        "error": res.get("error"),
+        "am_coverage_pct": am.get("coverage_pct"),
+        "am_present_hashed": am.get("present_hashed"),
+        "am_present_direct": am.get("present_direct"),
+        "am_missing_hashed": am.get("missing_hashed"),
+        "am_missing_direct": am.get("missing_direct"),
     }))
     return res
 

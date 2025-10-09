@@ -1,9 +1,9 @@
-# bot.py — v3.3 (envio direto; enriquecimento completo; sem fake; dedupe estável)
+# bot.py — v4.0 (envio direto; AM-friendly; sem dados fake; dedupe estável)
 # - Parser de /start robusto: t_<token> (Redis), JSON inline, Base64URL (b64:...), e k=v&...
-# - Enriquecimento real: fbc somente se vier _fbc OU fbclid; nunca “fake”
-# - login_id → external_id (identificação de login); zip/cep; click_id
+# - Sinais reais: NÃO cria _fbp “do nada” e só deriva _fbc se houver fbclid.
+# - login_id → external_id (identidade de login); zip/cep; click_id; consent snapshot
 # - event_id calculado já no bot (mantém dedupe consistente em toda a stack)
-# - Sem IP/UA inventados (usa apenas os do bridge quando existirem)
+# - Sem IP/UA inventados (usa apenas os do bridge quando existirem; caso ausente, não envia)
 # - Logs estruturados + métricas Prometheus
 # - Nenhuma ENV nova obrigatória
 
@@ -183,7 +183,7 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
     # fbc real: _fbc do cookie OU “fb.1.<ts>.<fbclid>” somente se houver fbclid
     fbc = args.get("_fbc") or (f"fb.1.{now}.{fbclid}" if fbclid else None)
 
-    # Não inventar IP/UA (só usa se vierem do Bridge)
+    # IP/UA: usa apenas se vierem do Bridge (sem default)
     ip_from_bridge = args.get("ip")
     ua_from_bridge = args.get("user_agent")
 
@@ -215,6 +215,9 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
     login_id = args.get("login_id")
     external_id = args.get("external_id") or login_id or str(user_id)
 
+    # consent snapshot (opcional, vindo do bridge)
+    consent = args.get("consent") if isinstance(args.get("consent"), dict) else None
+
     device_info = {
         "platform": "telegram",
         "app": "aiogram",
@@ -237,7 +240,8 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         "event_type": "Lead",
 
         # sinais técnicos (somente se reais)
-        "user_agent": ua_from_bridge or "TelegramBot/1.0",
+        # IMPORTANTE: não inventamos UA/IP; só repassamos se existirem
+        "user_agent": ua_from_bridge,
         "ip": ip_from_bridge,
         "event_source_url": event_source_url,
         "event_time": now_ts(),
@@ -273,6 +277,9 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         # espelho para utils/CAPI (hashing lá dentro)
         "_fbp": fbp,
         "_fbc": fbc,
+
+        # custom_data pré-existente (para preservarmos consent e outras flags)
+        "custom_data": {"consent": consent} if consent else None,
 
         "user_data": {
             "email": args.get("email"),
@@ -342,7 +349,11 @@ async def process_new_lead(msg: types.Message):
         "event": "EVENT_TRIGGERED",
         "dispatch_path": "direct",
         "type": "Lead",
-        "telegram_id": lead.get("telegram_id")
+        "telegram_id": lead.get("telegram_id"),
+        "has_fbp": bool(lead.get("_fbp")),
+        "has_fbc": bool(lead.get("_fbc")),
+        "has_fbclid": bool(lead.get("fbclid")),
+        "has_login_id": bool(lead.get("user_data", {}).get("login_id")),
     }))
 
     return vip_link, lead

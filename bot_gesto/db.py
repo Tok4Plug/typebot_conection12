@@ -1,11 +1,12 @@
-# db.py — v3.3 (enriquecimento persistido; sem dados fake; dedupe estável)
+# db.py — v4.0
+# (enriquecimento persistido; sem dados fake; dedupe estável; AM coverage)
 # - NÃO inventa _fbp/_fbc, IP ou UA (apenas persiste o que veio do Bridge/Typebot/Bot).
 # - Idempotência por event_key + event_id (histórico sem duplicatas).
 # - Espelhamento de UTM/CLIDs/GEO/Device/URL/IDs para custom_data (sem schema novo).
-# - Histórico consistente: [{event_type,event_id,event_time,status,ts}].
-# - Payload completo no sync/retrofeed (inclui event_id).
+# - Histórico consistente: [{event_type,event_id,event_time,status,ts,delivery,am}].
+# - Payload completo no sync/retrofeed (inclui event_id), sem fabricar cookies.
 # - Criptografia de cookies (Fernet ou base64).
-# - Nenhuma ENV nova obrigatória.
+# - Sem ENVs novos obrigatórios.
 
 import os, asyncio, json, time, hashlib, base64, logging
 from datetime import datetime, timezone
@@ -85,7 +86,6 @@ DATABASE_URL = (
     or os.getenv("POSTGRES_URL")
     or os.getenv("POSTGRESQL_URL")
 )
-
 engine = create_engine(
     DATABASE_URL,
     pool_size=int(os.getenv("DB_POOL_SIZE", 50)),
@@ -116,7 +116,7 @@ class Lead(Base):
     currency = Column(String(10), nullable=True)
 
     user_data = Column(JSONB, nullable=False, default=dict)   # plain (email/phone/ip/ua/etc.)
-    custom_data = Column(JSONB, nullable=True, default=dict)  # espelho UTM/CLIDs/GEO/Device/URL/IDs
+    custom_data = Column(JSONB, nullable=True, default=dict)  # UTM/CLIDs/GEO/Device/URL/IDs
 
     cookies = Column(JSONB, nullable=True)        # cifrados
     device_info = Column(JSONB, nullable=True)    # device/os/browser/platform/url
@@ -124,7 +124,7 @@ class Lead(Base):
 
     sent = Column(Boolean, default=False, index=True)
     sent_pixels = Column(JSONB, nullable=True, default=list)
-    event_history = Column(JSONB, nullable=True, default=list)  # [{event_type,event_id,event_time,status,ts}]
+    event_history = Column(JSONB, nullable=True, default=list)  # [{event_type,event_id,event_time,status,ts,delivery,am}]
 
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     last_attempt_at = Column(DateTime(timezone=True), nullable=True)
@@ -150,13 +150,12 @@ _CLID_KEYS = ("gclid", "wbraid", "gbraid", "fbclid", "cid", "_fbp", "_fbc", "cli
 _GEO_KEYS = ("country", "state", "city", "zip")
 _DEVICE_TOP_KEYS = ("device", "os", "browser", "platform")
 _URL_KEYS = ("event_source_url", "landing_url", "src_url")
-_ID_KEYS = ("login_id", "external_id")  # IDs auxiliares úteis para auditoria/normalização
+_ID_KEYS = ("login_id", "external_id")  # IDs auxiliares
 
 def _mirror_into_custom(data: Dict[str, Any]) -> Dict[str, Any]:
     """
     Copia UTMs, CLIDs, GEO, Device extras, URL e IDs auxiliares para custom_data.
-    Não sobrescreve valores já existentes.
-    Não cria _fbp/_fbc/IP/UA: apenas espelha o que chegou.
+    Não sobrescreve valores já existentes. Não cria _fbp/_fbc/IP/UA.
     """
     base = dict(data.get("custom_data") or {})
 
@@ -165,20 +164,17 @@ def _mirror_into_custom(data: Dict[str, Any]) -> Dict[str, Any]:
         v = data.get(k)
         if v is not None and base.get(k) in (None, ""):
             base[k] = v
-
-    # Click-IDs / cookies _fbp/_fbc já existentes
+    # Click IDs / cookies existentes
     for k in _CLID_KEYS:
         v = data.get(k)
         if v is not None and base.get(k) in (None, ""):
             base[k] = v
-
     # IDs auxiliares
     ud = data.get("user_data") or {}
     for k in _ID_KEYS:
         v = data.get(k) or ud.get(k)
         if v is not None and base.get(k) in (None, ""):
             base[k] = v
-
     # GEO (aceita nested geo)
     geo = data.get("geo") or {}
     for k in _GEO_KEYS:
@@ -187,19 +183,16 @@ def _mirror_into_custom(data: Dict[str, Any]) -> Dict[str, Any]:
             v = geo.get("region" if k == "state" else k)
         if v is not None and base.get(k) in (None, ""):
             base[k] = v
-
-    # Device extras no topo
+    # Device extras
     for k in _DEVICE_TOP_KEYS:
         v = data.get(k)
         if v is not None and base.get(k) in (None, ""):
             base[k] = v
-
-    # URLs úteis
+    # URLs
     for k in _URL_KEYS:
         v = data.get(k)
         if v is not None and base.get(k) in (None, ""):
             base[k] = v
-
     return base
 
 def _best_src_url(data: Dict[str, Any]) -> Optional[str]:
@@ -215,9 +208,6 @@ def _best_src_url(data: Dict[str, Any]) -> Optional[str]:
     )
 
 def _latest_event_time(row: Lead) -> int:
-    """
-    Recupera event_time mais recente do histórico; fallback created_at.
-    """
     try:
         hist = row.event_history or []
         if hist:
@@ -230,9 +220,6 @@ def _latest_event_time(row: Lead) -> int:
         return int(row.created_at.timestamp())
 
 def _latest_event_id(row: Lead) -> Optional[str]:
-    """
-    Recupera o último event_id salvo no histórico, se existir.
-    """
     try:
         hist = row.event_history or []
         for ev in reversed(hist):
@@ -243,6 +230,76 @@ def _latest_event_id(row: Lead) -> Optional[str]:
         pass
     return None
 
+# ------------------------------
+# Advanced Matching coverage (snapshot por evento)
+# ------------------------------
+def _am_coverage_from_lead(lead: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Calcula cobertura de Advanced Matching a partir do lead (sem logar dados sensíveis).
+    Usa utils.normalize_user_data para obter o mapa final de user_data (hash/direct).
+    """
+    ud = utils.normalize_user_data(lead.get("user_data") or lead) or {}
+    hashed_keys = ["em", "ph", "fn", "ln", "ct", "st", "country", "zp", "external_id"]
+    direct_keys = ["fbp", "fbc", "client_ip_address", "client_user_agent"]
+
+    present_hashed = [k for k in hashed_keys if ud.get(k)]
+    present_direct = [k for k in direct_keys if ud.get(k)]
+    missing_hashed = [k for k in hashed_keys if k not in present_hashed]
+    missing_direct = [k for k in direct_keys if k not in present_direct]
+
+    total = len(hashed_keys) + len(direct_keys)
+    present_total = len(present_hashed) + len(present_direct)
+    coverage = round(100.0 * present_total / total, 2) if total else 0.0
+
+    return {
+        "pct": coverage,
+        "present_hashed": present_hashed,
+        "present_direct": present_direct,
+        "missing_hashed": missing_hashed,
+        "missing_direct": missing_direct,
+        "total_fields": total,
+        "present_total": present_total
+    }
+
+# ------------------------------
+# Compactação de resultados de entrega (FB/GA4)
+# ------------------------------
+def _compact_result(res: Any) -> Dict[str, Any]:
+    """
+    Mantém apenas metadados de entrega não sensíveis.
+    Extrai 'events_received' e 'fbtrace_id' quando possível (FB).
+    """
+    if not isinstance(res, dict):
+        return {"ok": False}
+    out = {
+        "platform": res.get("platform"),
+        "event": res.get("event"),
+        "ok": res.get("ok"),
+        "status": res.get("status"),
+    }
+    body = res.get("body")
+    if isinstance(body, str):
+        try:
+            j = json.loads(body)
+            if isinstance(j, dict):
+                if "events_received" in j:
+                    out["events_received"] = j.get("events_received")
+                if "fbtrace_id" in j:
+                    out["fbtrace_id"] = j.get("fbtrace_id")
+        except Exception:
+            pass
+    return out
+
+def _trim_list(lst: List[Any], max_len: int = 20) -> List[Any]:
+    if not isinstance(lst, list):
+        return []
+    if len(lst) <= max_len:
+        return lst
+    return lst[-max_len:]
+
+# ==============================
+# Montagem do payload completo (para sync/retrofeed)
+# ==============================
 def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
     """
     Reconstrói o LEAD COMPLETO para envio aos pixels (com event_id).
@@ -317,7 +374,6 @@ def _assemble_lead_payload(row: Lead) -> Dict[str, Any]:
     }
 
     # Repasse dos campos úteis do user_data (plain)
-    # Sem fabricar IP/UA; apenas repassar se existirem.
     ext_id_fallback = (
         user.get("external_id")
         or custom.get("external_id")
@@ -654,9 +710,16 @@ async def sync_pending_leads(batch_size: int = 20) -> int:
     for row in rows:
         try:
             lead_payload = _assemble_lead_payload(row)
-            results = await send_event_to_all(lead_payload, et=lead_payload.get("event_type") or "Lead")
 
+            # Snapshot de Advanced Matching (antes do envio)
+            am = _am_coverage_from_lead(lead_payload)
+
+            results = await send_event_to_all(lead_payload, et=lead_payload.get("event_type") or "Lead")
             ok = any((isinstance(v, dict) and v.get("ok")) for v in (results or {}).values())
+
+            # Compactar resultados por plataforma
+            compact_delivery = {k: _compact_result(v) for k, v in (results or {}).items() if isinstance(v, dict)}
+
             session = SessionLocal()
             try:
                 obj = session.query(Lead).filter(Lead.id == row.id).first()
@@ -665,11 +728,47 @@ async def sync_pending_leads(batch_size: int = 20) -> int:
                     processed += 1
                     continue
 
+                # Atualiza flags e timestamps
+                now_iso = datetime.now(timezone.utc).isoformat()
                 if ok:
                     obj.sent = True
                     obj.last_sent_at = datetime.now(timezone.utc)
                 else:
                     obj.last_attempt_at = datetime.now(timezone.utc)
+
+                # Enriquecer histórico: marca o último event_id usado
+                # (igual ao de lead_payload) com status e telemetria
+                ev_id = lead_payload.get("event_id")
+                eh = obj.event_history or []
+                if ev_id:
+                    updated = False
+                    for ev in reversed(eh):
+                        if ev.get("event_id") == ev_id:
+                            ev["status"] = "sent" if ok else "attempted"
+                            ev["delivery"] = compact_delivery
+                            ev["am"] = am
+                            ev["ts_delivered"] = now_iso
+                            updated = True
+                            break
+                    if not updated:
+                        # Se por algum motivo não existir, criamos um registro coerente
+                        eh.append({
+                            "event_type": lead_payload.get("event_type") or "Lead",
+                            "event_id": ev_id,
+                            "event_time": lead_payload.get("event_time"),
+                            "status": "sent" if ok else "attempted",
+                            "delivery": compact_delivery,
+                            "am": am,
+                            "ts": now_iso,
+                            "ts_delivered": now_iso
+                        })
+                obj.event_history = eh
+
+                # sent_pixels (append compacto, cap 20)
+                sp = obj.sent_pixels or []
+                for k, v in compact_delivery.items():
+                    sp.append({"platform": v.get("platform") or k, "status": v.get("status"), "ok": v.get("ok"), "ts": now_iso})
+                obj.sent_pixels = _trim_list(sp, 20)
 
                 session.commit()
             except Exception as e:

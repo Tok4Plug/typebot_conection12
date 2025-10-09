@@ -1,8 +1,9 @@
-# utils.py — v3.3 (dedupe sólido; user_data avançado; sem dados fake)
+# utils.py — v3.3
+# (dedupe sólido; user_data avançado; sem dados fake)
 # - NÃO cria _fbp nem _fbc "do nada": só usa os que vierem do Bridge/Typebot.
-# - fbc só é derivado de fbclid se fbclid existir (formato fb.1.<ts>.<fbclid>).
+# - fbc só é derivado de fbclid se fbclid existir (fb.1.<ts>.<fbclid>).
 # - external_id prioriza login_id > external_id > telegram_id > user_id.
-# - CEP/ZIP normalizado por país (BR → só dígitos).
+# - CEP/ZIP normalizado por país (BR → apenas dígitos).
 # - event_id determinístico e estável em toda a stack.
 # - GA4 payload com UTM, device, clids e page_location; client_id consistente.
 
@@ -40,6 +41,26 @@ def _only_digits(s: Optional[str]) -> str:
 def now_ts() -> int:
     return int(time.time())
 
+def _to_int_ts(val: Optional[Any], default: Optional[int] = None) -> int:
+    """
+    Converte qualquer valor plausível para timestamp int; se falhar, usa default ou agora.
+    Aceita int, str numérica, float.
+    """
+    if val is None:
+        return default if default is not None else now_ts()
+    try:
+        if isinstance(val, (int,)):
+            return int(val)
+        if isinstance(val, float):
+            return int(val)
+        s = str(val).strip()
+        if not s:
+            return default if default is not None else now_ts()
+        # suporta "1696000123" ou "1696000123.0"
+        return int(float(s))
+    except Exception:
+        return default if default is not None else now_ts()
+
 def clamp_event_time(ts: Optional[int]) -> int:
     """
     Mantém event_time dentro da janela aceita pelo Facebook CAPI.
@@ -47,7 +68,7 @@ def clamp_event_time(ts: Optional[int]) -> int:
     - Futuro: corta em "agora"
     """
     now = now_ts()
-    base = int(ts) if ts is not None else now
+    base = _to_int_ts(ts, default=now)
     min_ts = int((datetime.now(timezone.utc) - timedelta(days=DROP_OLD_DAYS)).timestamp())
     if base < min_ts:
         return min_ts
@@ -118,7 +139,7 @@ def _compute_fbc_from_fbclid(fbclid: Optional[str], ts: Optional[int]) -> Option
     """
     if not fbclid:
         return None
-    t = int(ts or now_ts())
+    t = _to_int_ts(ts, default=now_ts())
     return f"fb.1.{t}.{fbclid}"
 
 # ==============================
@@ -212,7 +233,7 @@ def normalize_user_data(raw: Dict[str, Any]) -> Dict[str, Any]:
     fbclid = pick("fbclid")
     fbp_val = _first_non_empty(pick("fbp"), raw.get("_fbp"))
     # fbc: usa se fornecido; senão, deriva de fbclid (se houver)
-    event_time = clamp_event_time(pick("event_time"))  # robusto para string/int/None
+    event_time = clamp_event_time(_to_int_ts(pick("event_time"), default=None))
     provided_fbc = _first_non_empty(pick("fbc"), raw.get("_fbc"))
     fbc_val = provided_fbc if provided_fbc else _compute_fbc_from_fbclid(fbclid, event_time)
 
@@ -221,15 +242,15 @@ def normalize_user_data(raw: Dict[str, Any]) -> Dict[str, Any]:
     ua_val = _first_non_empty(pick("ua"), pick("user_agent"))
 
     ud: Dict[str, Any] = {}
-    if email:      ud["em"] = _sha256(email)
-    if phone:      ud["ph"] = _sha256(phone)
-    if fn:         ud["fn"] = _sha256(fn)
-    if ln:         ud["ln"] = _sha256(ln)
-    if country:    ud["country"] = _sha256(country)
-    if st:         ud["st"] = _sha256(st)
-    if ct:         ud["ct"] = _sha256(ct)
-    if zp:         ud["zp"] = _sha256(zp)
-    if external_id:ud["external_id"] = _sha256(external_id)
+    if email:       ud["em"] = _sha256(email)
+    if phone:       ud["ph"] = _sha256(phone)
+    if fn:          ud["fn"] = _sha256(fn)
+    if ln:          ud["ln"] = _sha256(ln)
+    if country:     ud["country"] = _sha256(country)
+    if st:          ud["st"] = _sha256(st)
+    if ct:          ud["ct"] = _sha256(ct)
+    if zp:          ud["zp"] = _sha256(zp)
+    if external_id: ud["external_id"] = _sha256(external_id)
 
     # Identificadores diretos aceitos pela CAPI (sem hash)
     if fbp_val: ud["fbp"] = fbp_val
@@ -272,7 +293,7 @@ def build_fb_payload(pixel_id: str, event_name: str, lead: Dict[str, Any]) -> Di
     - user_data normalizado (hash sensível; fbc só se real ou derivado de fbclid)
     - custom_data com UTM/device/geo/clids (campos livres para BI)
     """
-    raw_time = int(lead.get("event_time") or now_ts())
+    raw_time = _to_int_ts(lead.get("event_time"), default=now_ts())
     etime = clamp_event_time(raw_time)
     evid = get_or_build_event_id(event_name, lead, etime)
 
