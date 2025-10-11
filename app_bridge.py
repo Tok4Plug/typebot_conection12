@@ -5,7 +5,7 @@ import os, sys, json, time, secrets, logging, asyncio, base64, hashlib, importli
 from typing import Optional, Dict, Any, List, Tuple
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from redis import Redis
 from cryptography.fernet import Fernet
 from fastapi.responses import RedirectResponse
@@ -304,9 +304,9 @@ if ALLOWED_ORIGINS:
 # Schemas (compat + sinais AM)
 # =============================
 class TBPayload(BaseModel):
-    # IDs/cookies/click-ids
-    _fbp: Optional[str] = None
-    _fbc: Optional[str] = None
+    # IDs/cookies/click-ids — aceitar _fbp/_fbc via alias
+    fbp: Optional[str] = Field(default=None, alias="_fbp")
+    fbc: Optional[str] = Field(default=None, alias="_fbc")
     fbclid: Optional[str] = None
     gclid: Optional[str] = None
     gbraid: Optional[str] = None
@@ -346,15 +346,20 @@ class TBPayload(BaseModel):
     # IDs de usuário
     telegram_id: Optional[str] = None
     external_id: Optional[str] = None
-    login_id: Optional[str] = None  # identificação de login
+    login_id: Optional[str] = None
 
     # Consent
     consent: Optional[Dict[str, Any]] = None
 
     # Controle / Evento
     event: Optional[str] = None
-    event_id: Optional[str] = None     # <- ADICIONADO: dedupe CAPI com Pixel
+    event_id: Optional[str] = None
     extra: Optional[Dict[str, Any]] = None
+
+    class Config:
+        allow_population_by_field_name = True
+        underscore_attrs_are_private = False
+        extra = "allow"
 
 # =============================
 # Helpers (auth, tokens, consent)
@@ -408,7 +413,7 @@ def _parse_cookies(header_cookie: Optional[str]) -> Dict[str, Any]:
         for pair in header_cookie.split(";"):
             if "=" in pair:
                 k, v = pair.split("=", 1)
-                out[k.strip()] = v.strip()  # <-- corrigido bug de strip
+                out[k.strip()] = v.strip()
     except Exception:
         pass
 
@@ -496,6 +501,16 @@ def _enrich_payload(data: dict, req: Request) -> dict:
     """
     data = dict(data or {})
 
+    # Coalesce defensivo: aceitar fbp/fbc vindos como "fbp" OU "_fbp" (idem fbc)
+    co_fbp = data.get("fbp") or data.get("_fbp")
+    co_fbc = data.get("fbc") or data.get("_fbc")
+    if co_fbp:
+        data.setdefault("_fbp", co_fbp)
+        data.setdefault("fbp", co_fbp)
+    if co_fbc:
+        data.setdefault("_fbc", co_fbc)
+        data.setdefault("fbc", co_fbc)
+
     # Fold-in do "extra" (ex.: extra.login_id vindo do Typebot)
     extra = data.get("extra") if isinstance(data.get("extra"), dict) else {}
     for k in ("login_id", "external_id"):
@@ -518,13 +533,13 @@ def _enrich_payload(data: dict, req: Request) -> dict:
     if ck.get("gclid_hint") and not data.get("gclid"):
         data["gclid"] = ck["gclid_hint"]
 
-    # _fbc a partir de fbclid (permitido pela Meta)
+    # _fbc a partir de fbclid (permitido e recomendado pela Meta)
     if data.get("fbclid") and not data.get("_fbc"):
         data["_fbc"] = f"fb.1.{int(time.time())}.{data['fbclid']}"
+        # espelha também "fbc"
+        data["fbc"] = data["_fbc"]
 
     # NÃO criar _fbp se ausente
-    if data.get("_fbc") and not data.get("fbc"):
-        data["fbc"] = data["_fbc"]
     if data.get("_fbp") and not data.get("fbp"):
         data["fbp"] = data["_fbp"]
 
@@ -532,7 +547,7 @@ def _enrich_payload(data: dict, req: Request) -> dict:
     if not data.get("cid") and data.get("gclid"):
         data["cid"] = f"gclid.{data['gclid']}"
 
-    # IP/Geo
+    # IP/Geo reais
     if ip:
         data.setdefault("ip", ip)
         geo = geo_lookup(ip)
@@ -542,7 +557,7 @@ def _enrich_payload(data: dict, req: Request) -> dict:
             data.setdefault("city", data.get("city") or geo.get("city"))
             data.setdefault("state", data.get("state") or geo.get("region"))
 
-    # UA/Device
+    # UA/Device reais
     ua_info = parse_ua(ua)
     if ua_info:
         data.setdefault("user_agent", ua_info.get("ua"))
@@ -618,7 +633,8 @@ async def create_deeplink(
     x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
 ):
     _auth_guard(x_api_key, x_bridge_token, authorization)
-    data = _enrich_payload(body.dict(exclude_none=True), req)
+    # by_alias=True preserva _fbp/_fbc quando enviados do Typebot
+    data = _enrich_payload(body.dict(by_alias=True, exclude_none=True), req)
     token = _make_token()
     redis.setex(_key(token), TOKEN_TTL_SEC, json.dumps(data, ensure_ascii=False))
     return {"deep_link": _deep_link(token), "token": token, "expires_in": TOKEN_TTL_SEC}
@@ -662,8 +678,7 @@ async def ingest_event(
     Preserva `event_id` para deduplicação com o Pixel.
     """
     _auth_guard(x_api_key, x_bridge_token, authorization)
-    payload = body.dict(exclude_none=True)
-
+    payload = body.dict(by_alias=True, exclude_none=True)
     data = _enrich_payload(payload, req)
 
     # Nome do evento
@@ -677,7 +692,6 @@ async def ingest_event(
             "type": et,
             "event_id": data.get("event_id")
         }))
-        # Ainda assim, respondemos 200 para não provocar retries do frontend
         return {"status": "duplicate", "event_id": data.get("event_id")}
 
     # Persistência + envio (assíncronos)
@@ -704,7 +718,7 @@ async def webhook(
     authorization: Optional[str] = Header(default=None),
     x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
 ):
-    # Compat: trata como Lead (se precisar, mude Typebot para chamar /event?event_type=Lead)
+    # Compat: trata como Lead (ou chame /event?event_type=Lead do Typebot)
     return await ingest_event(
         req=req,
         body=body,

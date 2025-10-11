@@ -6,7 +6,7 @@
 # - Retry exponencial + jitter; timeouts independentes; logs estruturados.
 # - Auto-Subscribe opcional quando evento principal é Lead.
 # - GA4 opcional (Measurement Protocol) e modo debug com /debug/mp/collect.
-# - Compatível com app_bridge.py v4.1 (preserva event_id/event_type) e utils.py v3.3+.
+# - Compatível com app_bridge.py v4.1 e utils.py v4.0+.
 
 import os, aiohttp, asyncio, json, logging, random, time
 from typing import Dict, Any, Optional, List
@@ -20,7 +20,7 @@ try:
         build_fb_payload,
         build_ga4_payload,
         clamp_event_time,
-        get_or_build_event_id,   # <- usado no dedupe, respeita event_id existente
+        get_or_build_event_id,   # <- usado no dedupe
     )
 except Exception:
     # Fallback rodando solto
@@ -68,7 +68,6 @@ _mem_dedupe: Dict[str, float] = {}
 FB_API_VERSION = os.getenv("FB_API_VERSION", "v20.0")
 FB_PIXEL_ID = (os.getenv("FB_PIXEL_ID") or "").strip()
 FB_PIXEL_IDS = [p.strip() for p in (os.getenv("FB_PIXEL_IDS", "") or "").split(",") if p.strip()]
-# Se FB_PIXEL_IDS vier vazio, usa FB_PIXEL_ID único
 if not FB_PIXEL_IDS and FB_PIXEL_ID:
     FB_PIXEL_IDS = [FB_PIXEL_ID]
 
@@ -115,10 +114,17 @@ def _ensure_user_data_min(lead: Dict[str, Any]) -> Dict[str, Any]:
     SEM criar dados: apenas reaproveita os sinais reais já presentes.
     """
     ud: Dict[str, Any] = dict(lead.get("user_data") or {})
-    if "fbp" not in ud and lead.get("_fbp"):
-        ud["fbp"] = lead["_fbp"]
-    if "fbc" not in ud and lead.get("_fbc"):
-        ud["fbc"] = lead["_fbc"]
+    # Coalesce defensivo: aceita tanto _fbp/_fbc quanto fbp/fbc no topo do lead
+    if "fbp" not in ud:
+        if lead.get("_fbp"):
+            ud["fbp"] = lead["_fbp"]
+        elif lead.get("fbp"):
+            ud["fbp"] = lead["fbp"]
+    if "fbc" not in ud:
+        if lead.get("_fbc"):
+            ud["fbc"] = lead["_fbc"]
+        elif lead.get("fbc"):
+            ud["fbc"] = lead["fbc"]
     if "ip" not in ud and lead.get("ip"):
         ud["ip"] = lead["ip"]
     if "ua" not in ud:
@@ -144,7 +150,7 @@ def _coerce_lead(lead: Dict[str, Any]) -> Dict[str, Any]:
 def _event_dedupe_key(pixel_id: str, event_name: str, lead: Dict[str, Any]) -> str:
     """
     Chave determinística compatível com dedupe por event_id e com toda a stack.
-    Inclui o pixel_id quando há múltiplos pixels, para não bloquear o envio ao 2º pixel.
+    Inclui o pixel_id quando há múltiplos pixels, para não bloquear outro pixel.
     """
     ts = clamp_event_time(lead.get("event_time"))
     eid = get_or_build_event_id(event_name, lead, ts)
@@ -287,7 +293,7 @@ async def _send_event_fb_one(pixel_id: str, event_name: str, lead: Dict[str, Any
     if not pixel_id or not FB_ACCESS_TOKEN:
         return {"skip": True, "reason": "fb creds/pixel missing", "platform": "facebook", "event": event_name}
 
-    # Idempotência: evita duplicar reenvios acidentais por pixel
+    # Idempotência por pixel
     if not _dedupe_check_and_mark(pixel_id, event_name, lead):
         logger.info(json.dumps({
             "event": "FB_DEDUP_SKIP",
@@ -305,8 +311,7 @@ async def _send_event_fb_one(pixel_id: str, event_name: str, lead: Dict[str, Any
     am = _advanced_matching_coverage(payload)
 
     res = await _post_with_retry(url, payload, retries=FB_RETRY_MAX, platform="facebook", et=event_name)
-    # anexa pixel_id para clareza
-    res["pixel_id"] = pixel_id
+    res["pixel_id"] = pixel_id  # clareza nos logs/resultados
 
     logger.info(json.dumps({
         "event": "FB_SEND",
@@ -338,15 +343,19 @@ async def send_event_fb(event_name: str, lead: Dict[str, Any]) -> Dict[str, Any]
     results: Dict[str, Any] = {}
     for px in FB_PIXEL_IDS:
         results[px] = await _send_event_fb_one(px, event_name, lead)
-    # Mantém "facebook" como agregador para compat (worker/logs antigos)
-    results_flat = {
-        "ok": any(isinstance(v, dict) and v.get("ok") for v in results.values()),
-        "status": min([v.get("status", 200) for v in results.values() if isinstance(v, dict) and v.get("status")], default=None),
+
+    # Agregado (compat)
+    agg_ok = any(isinstance(v, dict) and v.get("ok") for v in results.values())
+    agg_statuses = [v.get("status") for v in results.values() if isinstance(v, dict) and v.get("status")]
+    agg_status = min(agg_statuses) if agg_statuses else None
+
+    return {
+        "ok": agg_ok,
+        "status": agg_status,
         "platform": "facebook",
         "event": event_name,
         "by_pixel": results
     }
-    return results_flat
 
 # ============================
 # Envio para Google GA4
