@@ -280,7 +280,7 @@ def derive_event_from_route(route_key: Optional[str]) -> Optional[str]:
 def should_send_event(event_name: Optional[str]) -> bool:
     if not event_name:
         return False
-    return event_name.lower() in ("lead", "subscribe")
+    return event_name.lower() in ("lead", "subscribe", "pageview", "viewcontent")
 
 # ==============================
 # Action Source dinâmico (Telegram ⇒ chat)
@@ -389,11 +389,19 @@ def build_fb_payload(pixel_id: str, event_name: str, lead: Dict[str, Any]) -> Di
 # Payload Google GA4 (Measurement Protocol)
 # ==============================
 def to_ga4_event_name(event_name: str) -> str:
+    """
+    Mapeia nomes Meta -> GA4 quando fizer sentido.
+    """
     e = (event_name or "").lower()
     if e == "lead":
         return "generate_lead"
     if e == "subscribe":
         return "subscribe"
+    if e in ("pageview", "page_view"):
+        return "page_view"
+    if e in ("viewcontent", "view_content"):
+        # Em GA4, equivalente semântico mais comum:
+        return "view_item"
     return e
 
 def build_ga4_payload(event_name: str, lead: Dict[str, Any]) -> Dict[str, Any]:

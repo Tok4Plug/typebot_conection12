@@ -1,14 +1,15 @@
-# fb_google.py — v4.0
-# (envio direto; idempotência estável; AM coverage logs; sem dados fake)
-# - NÃO inventa _fbp/_fbc, IP ou UA (só repassa sinais reais do Bridge/Typebot/Bot).
-# - Dedupe usa get_or_build_event_id (estável entre envio imediato e reprocesso).
-# - Retry exponencial + jitter; timeouts configuráveis.
+# fb_google.py — v4.2
+# (CAPI/GA4 direto; idempotência por event_id; AM coverage logs; multi-pixel; sem dados fake)
+# - NÃO inventa _fbp/_fbc, IP ou UA (sempre sinais 1P reais vindos do Bridge/Typebot/Bot).
+# - Dedupe por get_or_build_event_id (coeso com utils/bot/bridge), TTL configurável.
+# - Suporte a múltiplos Pixels (FB_PIXEL_ID ou FB_PIXEL_IDS="id1,id2").
+# - Retry exponencial + jitter; timeouts independentes; logs estruturados.
 # - Auto-Subscribe opcional quando evento principal é Lead.
-# - GA4 opcional (Measurement Protocol), com modo debug opcional.
-# - Logs estruturados, sem vazar segredos, incluindo cobertura de Advanced Matching.
+# - GA4 opcional (Measurement Protocol) e modo debug com /debug/mp/collect.
+# - Compatível com app_bridge.py v4.1 (preserva event_id/event_type) e utils.py v3.3+.
 
 import os, aiohttp, asyncio, json, logging, random, time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 # ============================
 # Imports utilitários (compat)
@@ -19,17 +20,17 @@ try:
         build_fb_payload,
         build_ga4_payload,
         clamp_event_time,
-        get_or_build_event_id,   # <- usado no dedupe
+        get_or_build_event_id,   # <- usado no dedupe, respeita event_id existente
     )
 except Exception:
     # Fallback rodando solto
-    import sys
-    sys.path.append(os.path.dirname(__file__))
+    import sys, os as _os
+    sys.path.append(_os.path.dirname(__file__))
     from utils import (  # type: ignore
         build_fb_payload,
         build_ga4_payload,
         clamp_event_time,
-        get_or_build_event_id,   # <- usado no dedupe
+        get_or_build_event_id,
     )
 
 # ============================
@@ -65,7 +66,12 @@ _mem_dedupe: Dict[str, float] = {}
 # Configurações de ENV
 # ============================
 FB_API_VERSION = os.getenv("FB_API_VERSION", "v20.0")
-FB_PIXEL_ID = os.getenv("FB_PIXEL_ID", "")
+FB_PIXEL_ID = (os.getenv("FB_PIXEL_ID") or "").strip()
+FB_PIXEL_IDS = [p.strip() for p in (os.getenv("FB_PIXEL_IDS", "") or "").split(",") if p.strip()]
+# Se FB_PIXEL_IDS vier vazio, usa FB_PIXEL_ID único
+if not FB_PIXEL_IDS and FB_PIXEL_ID:
+    FB_PIXEL_IDS = [FB_PIXEL_ID]
+
 FB_ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN", "")
 FB_TEST_EVENT_CODE = (os.getenv("FB_TEST_EVENT_CODE") or "").strip()  # opcional
 
@@ -92,8 +98,8 @@ logger.setLevel(logging.INFO)
 # ============================
 # Helpers
 # ============================
-def _build_fb_url() -> str:
-    base = f"https://graph.facebook.com/{FB_API_VERSION}/{FB_PIXEL_ID}/events?access_token={FB_ACCESS_TOKEN}"
+def _build_fb_url(pixel_id: str) -> str:
+    base = f"https://graph.facebook.com/{FB_API_VERSION}/{pixel_id}/events?access_token={FB_ACCESS_TOKEN}"
     if FB_TEST_EVENT_CODE:
         return base + f"&test_event_code={FB_TEST_EVENT_CODE}"
     return base
@@ -135,21 +141,21 @@ def _coerce_lead(lead: Dict[str, Any]) -> Dict[str, Any]:
     out.setdefault("__suppress_auto_subscribe", False)
     return out
 
-def _event_dedupe_key(event_name: str, lead: Dict[str, Any]) -> str:
+def _event_dedupe_key(pixel_id: str, event_name: str, lead: Dict[str, Any]) -> str:
     """
     Chave determinística compatível com dedupe por event_id e com toda a stack.
-    Usa get_or_build_event_id para respeitar event_id já definido no lead.
+    Inclui o pixel_id quando há múltiplos pixels, para não bloquear o envio ao 2º pixel.
     """
     ts = clamp_event_time(lead.get("event_time"))
     eid = get_or_build_event_id(event_name, lead, ts)
-    return f"{event_name.lower()}:{eid}"
+    return f"{pixel_id}:{event_name.lower()}:{eid}"
 
-def _dedupe_check_and_mark(event_name: str, lead: Dict[str, Any]) -> bool:
+def _dedupe_check_and_mark(pixel_id: str, event_name: str, lead: Dict[str, Any]) -> bool:
     """
     True => enviar (não visto recentemente); marca como visto.
     False => duplicado (pula envio).
     """
-    key = _event_dedupe_key(event_name, lead)
+    key = _event_dedupe_key(pixel_id, event_name, lead)
 
     # Redis SETNX com TTL
     if _redis_ok:
@@ -196,7 +202,7 @@ def _advanced_matching_coverage(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     total = len(hashed_keys) + len(direct_keys)
     present_total = len(present_hashed) + len(present_direct)
-    coverage = round(100.0 * present_total / total, 2)
+    coverage = round(100.0 * present_total / total, 2) if total else 0.0
 
     return {
         "coverage_pct": coverage,
@@ -272,34 +278,39 @@ async def _post_with_retry(
     return {"ok": False, "error": last_err, "platform": platform, "event": et}
 
 # ============================
-# Envio para Facebook CAPI
+# Envio para Facebook CAPI (1 pixel)
 # ============================
-async def send_event_fb(event_name: str, lead: Dict[str, Any]) -> Dict[str, Any]:
+async def _send_event_fb_one(pixel_id: str, event_name: str, lead: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Dispara evento para o Facebook CAPI (com idempotência).
+    Dispara evento para um único Pixel via CAPI (com idempotência por event_id).
     """
-    if not FB_PIXEL_ID or not FB_ACCESS_TOKEN:
-        return {"skip": True, "reason": "fb creds missing"}
+    if not pixel_id or not FB_ACCESS_TOKEN:
+        return {"skip": True, "reason": "fb creds/pixel missing", "platform": "facebook", "event": event_name}
 
-    # Idempotência: evita duplicar reenvios acidentais
-    if not _dedupe_check_and_mark(event_name, lead):
+    # Idempotência: evita duplicar reenvios acidentais por pixel
+    if not _dedupe_check_and_mark(pixel_id, event_name, lead):
         logger.info(json.dumps({
             "event": "FB_DEDUP_SKIP",
+            "pixel_id": pixel_id,
             "event_type": event_name,
             "telegram_id": lead.get("telegram_id"),
         }))
-        return {"ok": True, "status": 209, "body": "dedup_skip", "platform": "facebook", "event": event_name}
+        return {"ok": True, "status": 209, "body": "dedup_skip", "platform": "facebook", "event": event_name, "pixel_id": pixel_id}
 
-    url = _build_fb_url()
+    url = _build_fb_url(pixel_id)
     coerced = _coerce_lead(lead)  # sem inventar dados
-    payload = build_fb_payload(FB_PIXEL_ID, event_name, coerced)
+    payload = build_fb_payload(pixel_id, event_name, coerced)
 
     # Telemetria de cobertura de AM (para diagnóstico do "score")
     am = _advanced_matching_coverage(payload)
 
     res = await _post_with_retry(url, payload, retries=FB_RETRY_MAX, platform="facebook", et=event_name)
+    # anexa pixel_id para clareza
+    res["pixel_id"] = pixel_id
+
     logger.info(json.dumps({
         "event": "FB_SEND",
+        "pixel_id": pixel_id,
         "event_type": event_name,
         "telegram_id": coerced.get("telegram_id"),
         "status": res.get("status"),
@@ -312,6 +323,30 @@ async def send_event_fb(event_name: str, lead: Dict[str, Any]) -> Dict[str, Any]
         "am_missing_direct": am.get("missing_direct"),
     }))
     return res
+
+# ============================
+# Envio para Facebook CAPI (N pixels)
+# ============================
+async def send_event_fb(event_name: str, lead: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Dispara evento para 1..N Pixels (CAPI).
+    Retorna um dicionário por plataforma com resultados agregados.
+    """
+    if not FB_PIXEL_IDS or not FB_ACCESS_TOKEN:
+        return {"skip": True, "reason": "fb creds missing or no pixels configured"}
+
+    results: Dict[str, Any] = {}
+    for px in FB_PIXEL_IDS:
+        results[px] = await _send_event_fb_one(px, event_name, lead)
+    # Mantém "facebook" como agregador para compat (worker/logs antigos)
+    results_flat = {
+        "ok": any(isinstance(v, dict) and v.get("ok") for v in results.values()),
+        "status": min([v.get("status", 200) for v in results.values() if isinstance(v, dict) and v.get("status")], default=None),
+        "platform": "facebook",
+        "event": event_name,
+        "by_pixel": results
+    }
+    return results_flat
 
 # ============================
 # Envio para Google GA4
@@ -343,12 +378,11 @@ async def send_event_google(event_name: str, lead: Dict[str, Any]) -> Dict[str, 
 # ============================
 async def send_event_to_all(lead: Dict[str, Any], et: str = "Lead") -> Dict[str, Any]:
     """
-    Dispara evento (Lead/Subscribe) para:
-      - Facebook (sempre)
+    Dispara evento (PageView/ViewContent/Lead/Subscribe...) para:
+      - Facebook (1..N Pixels)
       - Google GA4 (se configurado)
 
-    Padrão A: Subscribe automático é opcional e só acontece AQUI
-    quando FB_AUTO_SUBSCRIBE_FROM_LEAD=1 e o evento for "Lead".
+    Subscribe automático (opcional) só quando o evento principal for "Lead".
     """
     results: Dict[str, Any] = {}
 
@@ -375,7 +409,7 @@ async def send_event_to_all(lead: Dict[str, Any], et: str = "Lead") -> Dict[str,
     return results
 
 # ============================
-# Retry wrapper (compat com bot.py)
+# Retry wrapper (compat com bot.py/retrofeed)
 # ============================
 async def send_event_with_retry(
     event_type: str,
@@ -384,7 +418,7 @@ async def send_event_with_retry(
     base_delay: float = 1.5
 ) -> Dict[str, Any]:
     """
-    Wrapper com retry exponencial; não duplica envios (idempotência aplicada em send_event_fb).
+    Wrapper com retry exponencial; não duplica envios (idempotência aplicada no dedupe por event_id).
     """
     attempt = 0
     while attempt < retries:
