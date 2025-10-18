@@ -1,5 +1,5 @@
 # =============================
-# app_bridge.py — v4.2 (Bridge first-party; AM-friendly; dedupe por event_id; Pydantic v2 fix; sem dados fake)
+# app_bridge.py — v4.2.1 (Bridge first-party; AM-friendly; dedupe por event_id; Pydantic v2 safe; sem dados fake)
 # =============================
 import os, sys, json, time, secrets, logging, asyncio, base64, hashlib, importlib.util
 from typing import Optional, Dict, Any, List, Tuple
@@ -7,7 +7,6 @@ from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydantic import ConfigDict
-from pydantic.alias_generators import AliasChoices
 from redis import Redis
 from cryptography.fernet import Fernet
 from fastapi.responses import RedirectResponse
@@ -194,7 +193,7 @@ if save_lead is None or send_event_to_all is None:
 logger.info(json.dumps({"event": "IMPORT_OK", **{k: v for k, v in IMPORT_INFO.items() if k != 'errors'}}))
 
 # =============================
-# ENV Bridge (sem novas ENVs obrigatórias)
+# ENV Bridge
 # =============================
 REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 BOT_USERNAME    = os.getenv("BOT_USERNAME", "").lstrip("@")
@@ -207,7 +206,6 @@ PORT            = int(os.getenv("PORT", "8080"))
 GEOIP_DB_PATH   = os.getenv("GEOIP_DB_PATH", "")
 USE_USER_AGENTS = os.getenv("USE_USER_AGENTS", "1") == "1"
 
-# Consent (captura apenas; decisão de uso fica a jusante)
 CONSENT_HEADER_KEYS = [h.strip() for h in (os.getenv("CONSENT_HEADER_KEYS", "X-Consent,X-TCF-String,TCF-String,GDPR-Consent") or "").split(",") if h.strip()]
 
 # Crypto
@@ -292,7 +290,7 @@ def parse_ua(ua: Optional[str]) -> Dict[str, Any]:
 # =============================
 # App FastAPI
 # =============================
-app = FastAPI(title="Typebot Bridge", version="4.2")
+app = FastAPI(title="Typebot Bridge", version="4.2.1")
 if ALLOWED_ORIGINS:
     app.add_middleware(
         CORSMiddleware,
@@ -303,7 +301,7 @@ if ALLOWED_ORIGINS:
     )
 
 # =============================
-# Helpers utilitários locais
+# Utils locais
 # =============================
 def _merge_if_empty(dst: Dict[str, Any], src: Dict[str, Any], keys: List[str]) -> None:
     for k in keys:
@@ -322,27 +320,18 @@ def _set_if_blank(d: Dict[str, Any], key: str, value: Optional[str]) -> None:
         d[key] = value
 
 # =============================
-# Schemas (compat + sinais AM)
+# Schema
 # =============================
 class TBPayload(BaseModel):
-    # Pydantic v2: aceitar _fbp/_fbc e também fbp/fbc; serializar como _fbp/_fbc
     model_config = ConfigDict(
-        protected_namespaces=(),          # permite nomes iniciando com "_"
+        protected_namespaces=(),   # permite campos iniciados com "_"
         populate_by_name=True,
-        extra="allow"
+        extra="allow"              # guarda fbp/fbc sem underscore como extra
     )
 
-    # IDs/cookies/click-ids
-    fbp: Optional[str] = Field(
-        default=None,
-        validation_alias=AliasChoices("_fbp", "fbp"),
-        serialization_alias="_fbp",
-    )
-    fbc: Optional[str] = Field(
-        default=None,
-        validation_alias=AliasChoices("_fbc", "fbc"),
-        serialization_alias="_fbc",
-    )
+    # IDs/click-ids — mantemos alias simples para _fbp/_fbc
+    fbp: Optional[str] = Field(default=None, alias="_fbp")
+    fbc: Optional[str] = Field(default=None, alias="_fbc")
     fbclid: Optional[str] = None
     gclid: Optional[str] = None
     gbraid: Optional[str] = None
@@ -365,7 +354,7 @@ class TBPayload(BaseModel):
     browser: Optional[str] = None
     platform: Optional[str] = None
 
-    # User fields
+    # User
     email: Optional[str] = None
     phone: Optional[str] = None
     first_name: Optional[str] = None
@@ -393,7 +382,7 @@ class TBPayload(BaseModel):
     extra: Optional[Dict[str, Any]] = None
 
 # =============================
-# Helpers (auth, tokens, consent)
+# Auth / tokens / consent helpers
 # =============================
 def _make_token(n: int = 16) -> str:
     return secrets.token_urlsafe(n)
@@ -448,7 +437,7 @@ def _parse_cookies(header_cookie: Optional[str]) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # Hints úteis (_ga → cid_hint)
+    # Hints: _ga -> cid_hint
     ga = out.get("_ga")
     if ga and "GA" in ga and not out.get("cid"):
         try:
@@ -471,13 +460,28 @@ def _parse_cookies(header_cookie: Optional[str]) -> Dict[str, Any]:
                 except Exception:
                     pass
 
-    # login id em cookie (se a página setar)
+    # login id
     for lk in ("login_id", "uid", "user_id"):
         if out.get(lk) and not out.get("login_id"):
             out["login_id"] = out[lk]
-
     return out
 
+# ===== Dedupe leve (bridge) por event_id — TTL 10 min =====
+_BRIDGE_DEDUPE_TTL = 600
+
+def _bridge_dedupe_mark(event_id: Optional[str]) -> bool:
+    if not event_id or (isinstance(event_id, str) and event_id.strip() == ""):
+        return True
+    try:
+        if redis.set(f"bridge:evid:{event_id}", "1", nx=True, ex=_BRIDGE_DEDUPE_TTL):
+            return True
+        return False
+    except Exception:
+        return True
+
+# =============================
+# Enriquecimento first-party
+# =============================
 def _extract_consent(req: Request, data: Dict[str, Any]) -> Dict[str, Any]:
     consent: Dict[str, Any] = dict(data.get("consent") or {})
     for hk in CONSENT_HEADER_KEYS:
@@ -493,41 +497,17 @@ def _extract_consent(req: Request, data: Dict[str, Any]) -> Dict[str, Any]:
         consent["dnt"] = dnt
     return consent
 
-# ===== Dedupe leve (bridge) por event_id — evita reprocesso em retries (TTL 10 min) =====
-_BRIDGE_DEDUPE_TTL = 600  # 10 minutos
-
-def _bridge_dedupe_mark(event_id: Optional[str]) -> bool:
-    """
-    True => pode seguir (não visto). False => duplicado recente.
-    Sem Redis, sempre retorna True (não bloqueia).
-    """
-    if not event_id or (isinstance(event_id, str) and event_id.strip() == ""):
-        return True
-    try:
-        if redis.set(f"bridge:evid:{event_id}", "1", nx=True, ex=_BRIDGE_DEDUPE_TTL):
-            return True
-        return False
-    except Exception:
-        return True
-
-# =============================
-# Enriquecimento first-party
-# =============================
 def _enrich_payload(data: dict, req: Request) -> dict:
     """
-    - IP real + Geo (quando disponível) [não sobrescreve se já veio válido]
-    - UA -> device/os/browser (do UA real) [não sobrescreve se já veio válido]
-    - NÃO cria _fbp; _fbc só é derivado se houver fbclid
-    - Aceita fbp/fbc sem underscore e normaliza para _fbp/_fbc
-    - cid/cid_hint/gclid_hint
-    - login_id: header/QS/cookies; external_id ← login_id (quando ausente)
-    - event_source_url: body > Referer
-    - consent snapshot
-    - preserva event_id / event (se fornecidos)
+    - Normaliza fbp/fbc -> _fbp/_fbc
+    - IP/UA reais (não sobrescreve se já vieram válidos)
+    - Deriva _fbc de fbclid
+    - Cookies/_ga/_gcl* hints
+    - login_id->external_id fallback
     """
     data = dict(data or {})
 
-    # Normalização/coalesce fbp/fbc -> _fbp/_fbc
+    # Normalização fbp/fbc
     co_fbp = data.get("_fbp") or data.get("fbp")
     co_fbc = data.get("_fbc") or data.get("fbc")
     if co_fbp:
@@ -537,13 +517,13 @@ def _enrich_payload(data: dict, req: Request) -> dict:
         data["_fbc"] = co_fbc
         data["fbc"] = co_fbc
 
-    # Fold-in do "extra"
+    # extra.login_id/external_id
     extra = data.get("extra") if isinstance(data.get("extra"), dict) else {}
     for k in ("login_id", "external_id"):
         if not data.get(k) and extra.get(k):
             data[k] = extra[k]
 
-    # event_source_url: body > Referer
+    # Referer -> event_source_url (fallback)
     referer = req.headers.get("Referer") or req.headers.get("referer")
     if not data.get("event_source_url") and referer:
         data["event_source_url"] = referer
@@ -552,27 +532,23 @@ def _enrich_payload(data: dict, req: Request) -> dict:
     ua = data.get("user_agent") or req.headers.get("user-agent")
     ck = _parse_cookies(req.headers.get("cookie"))
 
-    # Cookies -> corpo (sem sobrescrever valores já presentes)
+    # Cookies -> corpo
     _merge_if_empty(data, ck, ["_fbp", "_fbc", "cid", "login_id"])
     if ck.get("cid_hint") and not data.get("cid"):
         data["cid"] = ck["cid_hint"]
     if ck.get("gclid_hint") and not data.get("gclid"):
         data["gclid"] = ck["gclid_hint"]
 
-    # _fbc a partir de fbclid (permitido pela Meta)
+    # _fbc de fbclid
     if data.get("fbclid") and not data.get("_fbc"):
         data["_fbc"] = f"fb.1.{int(time.time())}.{data['fbclid']}"
         data["fbc"] = data["_fbc"]
 
-    # NÃO criar _fbp se ausente (somente ecoa se já existe)
-    if data.get("_fbp") and not data.get("fbp"):
-        data["fbp"] = data["_fbp"]
-
-    # CID fallback (GA4)
+    # CID de gclid (GA4)
     if not data.get("cid") and data.get("gclid"):
         data["cid"] = f"gclid.{data['gclid']}"
 
-    # IP/Geo reais — só grava se faltando ou vazio
+    # IP/Geo
     _set_if_blank(data, "ip", ip)
     if data.get("ip"):
         geo = geo_lookup(data["ip"])
@@ -582,7 +558,7 @@ def _enrich_payload(data: dict, req: Request) -> dict:
             data.setdefault("city", data.get("city") or geo.get("city"))
             data.setdefault("state", data.get("state") or geo.get("region"))
 
-    # UA/Device reais — só grava se faltando ou vazio
+    # UA/Device
     ua_info = parse_ua(ua)
     if ua_info:
         _set_if_blank(data, "user_agent", ua_info.get("ua"))
@@ -596,14 +572,14 @@ def _enrich_payload(data: dict, req: Request) -> dict:
     if qs.get("login_id") and not data.get("login_id"):
         data["login_id"] = qs.get("login_id")
 
-    # external_id ← login_id (quando ausente)
+    # external_id ← login_id
     if data.get("login_id") and not data.get("external_id"):
         data["external_id"] = data["login_id"]
 
-    # consent snapshot
+    # consent
     data["consent"] = _extract_consent(req, data)
 
-    # timestamp de recepção
+    # ts
     data.setdefault("ts", int(time.time()))
 
     logger.info(json.dumps({
@@ -629,7 +605,7 @@ async def _maybe_async(fn, *args, **kwargs):
     return res
 
 # =============================
-# App & Rotas
+# Rotas
 # =============================
 @app.get("/health")
 def health():
@@ -657,8 +633,9 @@ async def create_deeplink(
     x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
 ):
     _auth_guard(x_api_key, x_bridge_token, authorization)
-    # by_alias=True preserva _fbp/_fbc quando enviados do Typebot
-    data = _enrich_payload(body.dict(by_alias=True, exclude_none=True), req)
+    # Pydantic v2
+    payload = body.model_dump(by_alias=True, exclude_none=True)
+    data = _enrich_payload(payload, req)
     token = _make_token()
     redis.setex(_key(token), TOKEN_TTL_SEC, json.dumps(data, ensure_ascii=False))
     return {"deep_link": _deep_link(token), "token": token, "expires_in": TOKEN_TTL_SEC}
@@ -694,22 +671,15 @@ async def ingest_event(
     x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
     x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
     authorization: Optional[str] = Header(default=None),
-    event_type: Optional[str] = "Lead"   # query override: ?event_type=PageView|ViewContent|Lead|Subscribe...
+    event_type: Optional[str] = "Lead"
 ):
-    """
-    Recebe eventos do Typebot/web com cookies 1P reais e `event_id` (dedupe CAPI).
-    Prioridade de nome do evento: query ?event_type=  > body.event > "Lead".
-    Preserva `event_id` para deduplicação com o Pixel.
-    """
     _auth_guard(x_api_key, x_bridge_token, authorization)
-    payload = body.dict(by_alias=True, exclude_none=True)
+    payload = body.model_dump(by_alias=True, exclude_none=True)  # v2
     data = _enrich_payload(payload, req)
 
-    # Nome do evento
     et = (event_type or data.get("event") or "Lead")
-    data["event_type"] = et  # para downstream
+    data["event_type"] = et
 
-    # Dedupe leve no bridge por event_id (evita reprocesso em retries de rede)
     if not _bridge_dedupe_mark(data.get("event_id")):
         logger.info(json.dumps({
             "event": "BRIDGE_DEDUP_SKIP",
@@ -718,7 +688,6 @@ async def ingest_event(
         }))
         return {"status": "duplicate", "event_id": data.get("event_id")}
 
-    # Persistência + envio (assíncronos)
     asyncio.create_task(_maybe_async(save_lead, data))
     asyncio.create_task(_maybe_async(send_event_to_all, data, et=et))
 
@@ -742,7 +711,6 @@ async def webhook(
     authorization: Optional[str] = Header(default=None),
     x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
 ):
-    # Compat: trata como Lead (ou chame /event?event_type=Lead do Typebot)
     return await ingest_event(
         req=req,
         body=body,
@@ -760,7 +728,6 @@ async def bridge(
     authorization: Optional[str] = Header(default=None),
     x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
 ):
-    # Compat: trata como Lead
     return await ingest_event(
         req=req,
         body=body,
@@ -772,13 +739,7 @@ async def bridge(
 
 @app.get("/apply")
 async def apply_redirect(req: Request):
-    """
-    Endpoint de conversão direta (sem corpo).
-    Extrai QS/cookies/UA/IP → gera deep link Telegram com token efêmero no Redis.
-    """
     base_payload: Dict[str, Any] = {"source": "apply"}
-
-    # Espelha QS de forma segura (sem sobrescrever)
     try:
         if req.query_params:
             base_payload["qs"] = dict(req.query_params)
