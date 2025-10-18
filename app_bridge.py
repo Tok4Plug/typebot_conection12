@@ -1,11 +1,13 @@
 # =============================
-# app_bridge.py — v4.1 (Bridge first-party; AM-friendly; dedupe por event_id; sem dados fake)
+# app_bridge.py — v4.2 (Bridge first-party; AM-friendly; dedupe por event_id; Pydantic v2 fix; sem dados fake)
 # =============================
 import os, sys, json, time, secrets, logging, asyncio, base64, hashlib, importlib.util
 from typing import Optional, Dict, Any, List, Tuple
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from pydantic import ConfigDict
+from pydantic.alias_generators import AliasChoices
 from redis import Redis
 from cryptography.fernet import Fernet
 from fastapi.responses import RedirectResponse
@@ -290,7 +292,7 @@ def parse_ua(ua: Optional[str]) -> Dict[str, Any]:
 # =============================
 # App FastAPI
 # =============================
-app = FastAPI(title="Typebot Bridge", version="4.1")
+app = FastAPI(title="Typebot Bridge", version="4.2")
 if ALLOWED_ORIGINS:
     app.add_middleware(
         CORSMiddleware,
@@ -301,12 +303,46 @@ if ALLOWED_ORIGINS:
     )
 
 # =============================
+# Helpers utilitários locais
+# =============================
+def _merge_if_empty(dst: Dict[str, Any], src: Dict[str, Any], keys: List[str]) -> None:
+    for k in keys:
+        v = src.get(k)
+        if v is not None and (dst.get(k) in (None, "")):
+            dst[k] = v
+
+def _set_if_blank(d: Dict[str, Any], key: str, value: Optional[str]) -> None:
+    if value is None:
+        return
+    cur = d.get(key)
+    if cur is None:
+        d[key] = value
+        return
+    if isinstance(cur, str) and cur.strip() == "":
+        d[key] = value
+
+# =============================
 # Schemas (compat + sinais AM)
 # =============================
 class TBPayload(BaseModel):
-    # IDs/cookies/click-ids — aceitar _fbp/_fbc via alias
-    fbp: Optional[str] = Field(default=None, alias="_fbp")
-    fbc: Optional[str] = Field(default=None, alias="_fbc")
+    # Pydantic v2: aceitar _fbp/_fbc e também fbp/fbc; serializar como _fbp/_fbc
+    model_config = ConfigDict(
+        protected_namespaces=(),          # permite nomes iniciando com "_"
+        populate_by_name=True,
+        extra="allow"
+    )
+
+    # IDs/cookies/click-ids
+    fbp: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("_fbp", "fbp"),
+        serialization_alias="_fbp",
+    )
+    fbc: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("_fbc", "fbc"),
+        serialization_alias="_fbc",
+    )
     fbclid: Optional[str] = None
     gclid: Optional[str] = None
     gbraid: Optional[str] = None
@@ -355,11 +391,6 @@ class TBPayload(BaseModel):
     event: Optional[str] = None
     event_id: Optional[str] = None
     extra: Optional[Dict[str, Any]] = None
-
-    class Config:
-        allow_population_by_field_name = True
-        underscore_attrs_are_private = False
-        extra = "allow"
 
 # =============================
 # Helpers (auth, tokens, consent)
@@ -447,12 +478,6 @@ def _parse_cookies(header_cookie: Optional[str]) -> Dict[str, Any]:
 
     return out
 
-def _merge_if_empty(dst: Dict[str, Any], src: Dict[str, Any], keys: List[str]) -> None:
-    for k in keys:
-        v = src.get(k)
-        if v is not None and (dst.get(k) in (None, "")):
-            dst[k] = v
-
 def _extract_consent(req: Request, data: Dict[str, Any]) -> Dict[str, Any]:
     consent: Dict[str, Any] = dict(data.get("consent") or {})
     for hk in CONSENT_HEADER_KEYS:
@@ -476,7 +501,7 @@ def _bridge_dedupe_mark(event_id: Optional[str]) -> bool:
     True => pode seguir (não visto). False => duplicado recente.
     Sem Redis, sempre retorna True (não bloqueia).
     """
-    if not event_id:
+    if not event_id or (isinstance(event_id, str) and event_id.strip() == ""):
         return True
     try:
         if redis.set(f"bridge:evid:{event_id}", "1", nx=True, ex=_BRIDGE_DEDUPE_TTL):
@@ -490,9 +515,10 @@ def _bridge_dedupe_mark(event_id: Optional[str]) -> bool:
 # =============================
 def _enrich_payload(data: dict, req: Request) -> dict:
     """
-    - IP real + Geo (quando disponível)
-    - UA -> device/os/browser (do UA real)
+    - IP real + Geo (quando disponível) [não sobrescreve se já veio válido]
+    - UA -> device/os/browser (do UA real) [não sobrescreve se já veio válido]
     - NÃO cria _fbp; _fbc só é derivado se houver fbclid
+    - Aceita fbp/fbc sem underscore e normaliza para _fbp/_fbc
     - cid/cid_hint/gclid_hint
     - login_id: header/QS/cookies; external_id ← login_id (quando ausente)
     - event_source_url: body > Referer
@@ -501,17 +527,17 @@ def _enrich_payload(data: dict, req: Request) -> dict:
     """
     data = dict(data or {})
 
-    # Coalesce defensivo: aceitar fbp/fbc vindos como "fbp" OU "_fbp" (idem fbc)
-    co_fbp = data.get("fbp") or data.get("_fbp")
-    co_fbc = data.get("fbc") or data.get("_fbc")
+    # Normalização/coalesce fbp/fbc -> _fbp/_fbc
+    co_fbp = data.get("_fbp") or data.get("fbp")
+    co_fbc = data.get("_fbc") or data.get("fbc")
     if co_fbp:
-        data.setdefault("_fbp", co_fbp)
-        data.setdefault("fbp", co_fbp)
+        data["_fbp"] = co_fbp
+        data["fbp"] = co_fbp
     if co_fbc:
-        data.setdefault("_fbc", co_fbc)
-        data.setdefault("fbc", co_fbc)
+        data["_fbc"] = co_fbc
+        data["fbc"] = co_fbc
 
-    # Fold-in do "extra" (ex.: extra.login_id vindo do Typebot)
+    # Fold-in do "extra"
     extra = data.get("extra") if isinstance(data.get("extra"), dict) else {}
     for k in ("login_id", "external_id"):
         if not data.get(k) and extra.get(k):
@@ -526,41 +552,40 @@ def _enrich_payload(data: dict, req: Request) -> dict:
     ua = data.get("user_agent") or req.headers.get("user-agent")
     ck = _parse_cookies(req.headers.get("cookie"))
 
-    # Espelha cookies -> corpo (sem sobrescrever)
+    # Cookies -> corpo (sem sobrescrever valores já presentes)
     _merge_if_empty(data, ck, ["_fbp", "_fbc", "cid", "login_id"])
     if ck.get("cid_hint") and not data.get("cid"):
         data["cid"] = ck["cid_hint"]
     if ck.get("gclid_hint") and not data.get("gclid"):
         data["gclid"] = ck["gclid_hint"]
 
-    # _fbc a partir de fbclid (permitido e recomendado pela Meta)
+    # _fbc a partir de fbclid (permitido pela Meta)
     if data.get("fbclid") and not data.get("_fbc"):
         data["_fbc"] = f"fb.1.{int(time.time())}.{data['fbclid']}"
-        # espelha também "fbc"
         data["fbc"] = data["_fbc"]
 
-    # NÃO criar _fbp se ausente
+    # NÃO criar _fbp se ausente (somente ecoa se já existe)
     if data.get("_fbp") and not data.get("fbp"):
         data["fbp"] = data["_fbp"]
 
-    # CID fallback (GA4 MP)
+    # CID fallback (GA4)
     if not data.get("cid") and data.get("gclid"):
         data["cid"] = f"gclid.{data['gclid']}"
 
-    # IP/Geo reais
-    if ip:
-        data.setdefault("ip", ip)
-        geo = geo_lookup(ip)
+    # IP/Geo reais — só grava se faltando ou vazio
+    _set_if_blank(data, "ip", ip)
+    if data.get("ip"):
+        geo = geo_lookup(data["ip"])
         if geo:
             data.setdefault("geo", geo)
             data.setdefault("country", data.get("country") or geo.get("country"))
             data.setdefault("city", data.get("city") or geo.get("city"))
             data.setdefault("state", data.get("state") or geo.get("region"))
 
-    # UA/Device reais
+    # UA/Device reais — só grava se faltando ou vazio
     ua_info = parse_ua(ua)
     if ua_info:
-        data.setdefault("user_agent", ua_info.get("ua"))
+        _set_if_blank(data, "user_agent", ua_info.get("ua"))
         _merge_if_empty(data, ua_info, ["device", "os", "browser"])
 
     # login_id de header/QS
@@ -582,8 +607,8 @@ def _enrich_payload(data: dict, req: Request) -> dict:
     data.setdefault("ts", int(time.time()))
 
     logger.info(json.dumps({
-        "event": "ENRICH_OK",
-        "ip": data.get("ip"),
+        "event": data.get("event"),
+        "ip": data.get("ip") or "",
         "has_fbp": bool(data.get("_fbp") or data.get("fbp")),
         "has_fbc": bool(data.get("_fbc") or data.get("fbc")),
         "has_fbclid": bool(data.get("fbclid")),
@@ -592,7 +617,6 @@ def _enrich_payload(data: dict, req: Request) -> dict:
         "os": data.get("os"),
         "browser": data.get("browser"),
         "consent_keys": list((data.get("consent") or {}).keys()) if data.get("consent") else [],
-        "event": data.get("event"),
         "event_id": data.get("event_id"),
     }))
 
