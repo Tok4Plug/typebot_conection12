@@ -57,7 +57,7 @@ RUN curl -L -o /app/GeoLite2-City.mmdb \
 # 7) Expor portas
 # -----------------------------
 EXPOSE 8080
-EXPOSE 8000
+EXPOSE 8080
 
 # -----------------------------
 # 8) Entrypoint
