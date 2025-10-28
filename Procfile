@@ -36,7 +36,7 @@ migrate: alembic upgrade head
 # Observações:
 # - Railway entende cada linha como serviço separado (bot, worker, admin, etc.)
 # - release garante que migrations rodem ANTES do deploy
-# - admin (porta 8000) recomendado como healthcheck no Railway
+# - admin (porta 8080) recomendado como healthcheck no Railway
 # - bridge (porta 8080) deve ser exposto ao público (entrada do Typebot)
 # - worker/retrofeed/dlq/scheduler podem ser escalados separadamente conforme a carga
 # =============================

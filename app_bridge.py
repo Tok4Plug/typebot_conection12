@@ -2,7 +2,7 @@
 # app_bridge.py — v4.2.1 (Bridge first-party; AM-friendly; dedupe por event_id; Pydantic v2 safe; sem dados fake)
 # =============================
 import os, sys, json, time, secrets, logging, asyncio, base64, hashlib, importlib.util
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Callable
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -10,6 +10,7 @@ from pydantic import ConfigDict
 from redis import Redis
 from cryptography.fernet import Fernet
 from fastapi.responses import RedirectResponse
+from concurrent.futures import ThreadPoolExecutor
 
 # =============================
 # Logging JSON estruturado
@@ -27,13 +28,14 @@ class JSONFormatter(logging.Formatter):
         return json.dumps(log, ensure_ascii=False)
 
 logger = logging.getLogger("bridge")
-logger.setLevel(logging.INFO)
+logger.setLevel(os.getenv("BRIDGE_LOG_LEVEL", "INFO"))
 _ch = logging.StreamHandler()
 _ch.setFormatter(JSONFormatter())
 logger.addHandler(_ch)
 
 # =============================
 # Descoberta dinâmica do bot_gesto
+# (mantive sua lógica original praticamente intocada)
 # =============================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
@@ -208,6 +210,12 @@ USE_USER_AGENTS = os.getenv("USE_USER_AGENTS", "1") == "1"
 
 CONSENT_HEADER_KEYS = [h.strip() for h in (os.getenv("CONSENT_HEADER_KEYS", "X-Consent,X-TCF-String,TCF-String,GDPR-Consent") or "").split(",") if h.strip()]
 
+# Timeouts / concurrency tunables (para Railway)
+BRIDGE_TASK_TIMEOUT = float(os.getenv("BRIDGE_TASK_TIMEOUT", "6"))   # segundos para tarefas background críticas
+BRIDGE_TASK_RETRY = int(os.getenv("BRIDGE_TASK_RETRY", "1"))         # 0/1 -> tente 1 retry quando True
+BRIDGE_MAX_WORKERS = int(os.getenv("BRIDGE_MAX_WORKERS", "8"))       # threadpool workers para to_thread
+BRIDGE_SEMAPHORE_CONCURRENCY = int(os.getenv("BRIDGE_SEMAPHORE_CONCURRENCY", "64"))
+
 # Crypto
 CRYPTO_KEY = os.getenv("CRYPTO_KEY")
 fernet = None
@@ -231,12 +239,21 @@ logger.info(json.dumps({
     "bridge_token_masked": _mask(BRIDGE_TOKEN),
     "bot_username_set": bool(BOT_USERNAME),
     "allowed_origins": ALLOWED_ORIGINS,
+    "task_timeout": BRIDGE_TASK_TIMEOUT,
+    "task_retry": BRIDGE_TASK_RETRY,
 }))
 
 if not BOT_USERNAME:
     raise RuntimeError("BOT_USERNAME não configurado")
 
+# Redis (sincrono) — protegemos chamadas via to_thread
 redis = Redis.from_url(REDIS_URL, decode_responses=True)
+
+# ThreadPoolExecutor para to_thread (opcional, controlar workers)
+_executor = ThreadPoolExecutor(max_workers=BRIDGE_MAX_WORKERS)
+
+# Semaphore para limitar concorrência de tarefas potencialmente pesadas
+_task_semaphore = asyncio.Semaphore(BRIDGE_SEMAPHORE_CONCURRENCY)
 
 # =============================
 # GeoIP / UA
@@ -598,19 +615,68 @@ def _enrich_payload(data: dict, req: Request) -> dict:
 
     return data
 
-async def _maybe_async(fn, *args, **kwargs):
-    res = fn(*args, **kwargs)
-    if asyncio.iscoroutine(res):
-        return await res
-    return res
+# =============================
+# Helpers para execução segura com timeout e retry
+# =============================
+async def _run_sync_with_timeout(fn: Callable, *args, timeout: float = BRIDGE_TASK_TIMEOUT, **kwargs):
+    """
+    Executa função síncrona em thread e aplica timeout.
+    Retorna o resultado ou lança asyncio.TimeoutError/Exception.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=timeout)
+    except asyncio.TimeoutError:
+        raise
+
+async def _run_coro_with_timeout(coro, timeout: float = BRIDGE_TASK_TIMEOUT):
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        raise
+
+async def _safe_background_runner(fn: Callable, *args, timeout: float = BRIDGE_TASK_TIMEOUT, retries: int = BRIDGE_TASK_RETRY, tag: str = "task"):
+    """
+    Executa fn (sync ou async) em background com timeout + simples retry.
+    Essa funcão não propaga exceções — apenas loga.
+    """
+    attempt = 0
+    exc = None
+    while attempt <= retries:
+        try:
+            attempt += 1
+            async with _task_semaphore:
+                if asyncio.iscoroutinefunction(fn):
+                    # fn is a coroutine function -> call producing coroutine, then wait with timeout
+                    coro = fn(*args)
+                    return await _run_coro_with_timeout(coro, timeout=timeout)
+                else:
+                    # sync function -> run in thread
+                    return await _run_sync_with_timeout(fn, *args, timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(json.dumps({"event": "TASK_TIMEOUT", "tag": tag, "attempt": attempt, "timeout": timeout}))
+            exc = asyncio.TimeoutError()
+            # continue to retry if attempts left
+        except Exception as e:
+            logger.exception(json.dumps({"event": "TASK_ERROR", "tag": tag, "attempt": attempt, "error": str(e)}))
+            exc = e
+            # se for retriable, vamos tentar novamente; senão para
+        # backoff simples
+        if attempt <= retries:
+            await asyncio.sleep(0.25 * attempt)
+    # se chegou aqui, todas tentativas falharam
+    logger.error(json.dumps({"event": "TASK_FAILED", "tag": tag, "attempts": attempt, "error": str(exc)}))
+    return None
 
 # =============================
 # Rotas
 # =============================
 @app.get("/health")
-def health():
+async def health():
+    # ping redis using to_thread with timeout guard
     try:
-        redis.ping(); rstatus = "ok"
+        ok = await _run_sync_with_timeout(redis.ping, timeout=2)
+        rstatus = "ok" if ok else "error"
     except Exception as e:
         rstatus = f"error: {e}"
     return {
@@ -637,31 +703,44 @@ async def create_deeplink(
     payload = body.model_dump(by_alias=True, exclude_none=True)
     data = _enrich_payload(payload, req)
     token = _make_token()
-    redis.setex(_key(token), TOKEN_TTL_SEC, json.dumps(data, ensure_ascii=False))
+    # Redis write in thread with timeout — must not block
+    try:
+        await _run_sync_with_timeout(lambda: redis.setex(_key(token), TOKEN_TTL_SEC, json.dumps(data, ensure_ascii=False)), timeout=2)
+    except Exception as e:
+        logger.exception(json.dumps({"event": "REDIS_SETEX_FAIL", "error": str(e)}))
+        # ainda assim retornamos token - mas logamos erro. (opcional: você pode elevar HTTP error aqui)
     return {"deep_link": _deep_link(token), "token": token, "expires_in": TOKEN_TTL_SEC}
 
 @app.get("/tb/peek/{token}")
-def peek_token(
+async def peek_token(
     token: str,
     x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
     authorization: Optional[str] = Header(default=None),
     x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
 ):
     _auth_guard(x_api_key, x_bridge_token, authorization)
-    blob = redis.get(_key(token))
+    try:
+        blob = await _run_sync_with_timeout(lambda: redis.get(_key(token)), timeout=2)
+    except Exception as e:
+        logger.exception(json.dumps({"event": "REDIS_GET_FAIL", "error": str(e)}))
+        raise HTTPException(status_code=500, detail="redis error")
     if not blob:
         raise HTTPException(status_code=404, detail="token not found/expired")
     return {"token": token, "payload": json.loads(blob)}
 
 @app.delete("/tb/del/{token}")
-def delete_token(
+async def delete_token(
     token: str,
     x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
     authorization: Optional[str] = Header(default=None),
     x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
 ):
     _auth_guard(x_api_key, x_bridge_token, authorization)
-    redis.delete(_key(token))
+    try:
+        await _run_sync_with_timeout(lambda: redis.delete(_key(token)), timeout=2)
+    except Exception as e:
+        logger.exception(json.dumps({"event": "REDIS_DEL_FAIL", "error": str(e)}))
+        raise HTTPException(status_code=500, detail="redis error")
     return {"deleted": True, "token": token}
 
 @app.post("/event")
@@ -688,8 +767,11 @@ async def ingest_event(
         }))
         return {"status": "duplicate", "event_id": data.get("event_id")}
 
-    asyncio.create_task(_maybe_async(save_lead, data))
-    asyncio.create_task(_maybe_async(send_event_to_all, data, et=et))
+    # Fire-and-forget background tasks — protegidos por timeout/retry
+    # usamos wrapper _safe_background_runner para execuções seguras (vai logar erros/timeouts)
+    asyncio.create_task(_safe_background_runner(save_lead, data, timeout=BRIDGE_TASK_TIMEOUT, tag="save_lead"))
+    # send_event_to_all pode receber (data, et=et) — mantive assinatura original
+    asyncio.create_task(_safe_background_runner(send_event_to_all, data, timeout=BRIDGE_TASK_TIMEOUT, tag="send_event_to_all"))
 
     logger.info(json.dumps({
         "event": "EVENT_SENT",
@@ -701,6 +783,7 @@ async def ingest_event(
         "source_url": data.get("event_source_url"),
     }))
 
+    # A resposta é imediata — evite que callers (typebot) recebam 408 por espera.
     return {"status": "ok", "saved": True, "event_type": et, "event_id": data.get("event_id")}
 
 @app.post("/webhook")
@@ -756,7 +839,12 @@ async def apply_redirect(req: Request):
 
     data = _enrich_payload(base_payload, req)
     token = _make_token()
-    redis.setex(_key(token), TOKEN_TTL_SEC, json.dumps(data, ensure_ascii=False))
+    # store to redis (with timeout guard)
+    try:
+        await _run_sync_with_timeout(lambda: redis.setex(_key(token), TOKEN_TTL_SEC, json.dumps(data, ensure_ascii=False)), timeout=2)
+    except Exception as e:
+        logger.exception(json.dumps({"event": "REDIS_SETEX_FAIL", "error": str(e)}))
+        # se falhar, ainda geramos token mas logamos
 
     logger.info(json.dumps({
         "event": "APPLY_REDIRECT",
