@@ -1,5 +1,6 @@
-# app_bridge.py — v5.0.0
+# app_bridge.py — v5.0.1
 # Bridge otimizado para Railway: timeouts, fallback in-memory, persistência fbp/fbc, safe background tasks
+# Adição: resiliência DB (fila in-memory para leads pendentes + flush automatico)
 import os
 import sys
 import json
@@ -224,6 +225,10 @@ BRIDGE_MAX_WORKERS = int(os.getenv("BRIDGE_MAX_WORKERS", "8"))
 BRIDGE_SEMAPHORE_CONCURRENCY = int(os.getenv("BRIDGE_SEMAPHORE_CONCURRENCY", "64"))
 BRIDGE_PERSIST_FBC_FBP = os.getenv("BRIDGE_PERSIST_FBC_FBP", "1") == "1"
 
+# DB retry tunables
+DB_RETRY_ATTEMPTS = int(os.getenv("DB_RETRY_ATTEMPTS", "3"))
+DB_RETRY_BACKOFF = float(os.getenv("DB_RETRY_BACKOFF", "0.5"))  # base backoff seconds
+
 # Crypto
 CRYPTO_KEY = os.getenv("CRYPTO_KEY")
 fernet = None
@@ -377,7 +382,7 @@ def parse_ua(ua: Optional[str]) -> Dict[str, Any]:
 # =============================
 # FastAPI app + CORS
 # =============================
-app = FastAPI(title="Typebot Bridge", version="5.0.0")
+app = FastAPI(title="Typebot Bridge", version="5.0.1")
 if ALLOWED_ORIGINS:
     app.add_middleware(
         CORSMiddleware,
@@ -557,9 +562,7 @@ def _bridge_dedupe_mark(event_id: Optional[str]) -> bool:
             return bool(ok)
         else:
             key = f"bridge:evid:{event_id}"
-            # grava no inmem store com TTL
             exp = time.time() + _BRIDGE_DEDUPE_TTL
-            # operação síncrona leve (único processo)
             _inmem_store[key] = (exp, "1")
             return True
     except Exception:
@@ -704,7 +707,120 @@ async def _safe_background_runner(fn: Callable, *args, timeout: float = BRIDGE_T
     return None
 
 # =============================
-# Rotas (mantidas, com melhorias de timeout/fallback)
+# DB resilience: fila de leads pendentes (in-memory) + wrapper save_lead
+# =============================
+_db_available: bool = True  # assume true until we detect otherwise
+_db_queue: List[Dict[str, Any]] = []
+_db_queue_lock = asyncio.Lock()
+
+async def _enqueue_lead_for_db(payload: Dict[str, Any]):
+    async with _db_queue_lock:
+        _db_queue.append(payload)
+        logger.warning(json.dumps({"event":"DB_ENQUEUE","queue_length": len(_db_queue)}))
+
+async def _flush_db_queue():
+    """
+    Tenta salvar os leads pendentes usando save_lead.
+    Faz backoff simples entre tentativas.
+    """
+    global _db_available
+    if not save_lead:
+        return
+    async with _db_queue_lock:
+        queue_copy = list(_db_queue)
+    if not queue_copy:
+        return
+
+    for idx, item in enumerate(queue_copy):
+        try:
+            # chama save_lead com timeout e retries
+            res = await _safe_background_runner(save_lead, item, timeout=BRIDGE_TASK_TIMEOUT, retries=DB_RETRY_ATTEMPTS, tag="flush_save_lead")
+            # se retornou None -> possivelmente falhou; nesse caso, interrompe flush para evitar loop agressivo
+            if res is None:
+                logger.warning(json.dumps({"event":"DB_FLUSH_PARTIAL","idx": idx}))
+                _db_available = False
+                break
+            # se ok, remove do queue
+            async with _db_queue_lock:
+                if item in _db_queue:
+                    _db_queue.remove(item)
+            logger.info(json.dumps({"event":"DB_FLUSHED_ONE","remaining": len(_db_queue)}))
+        except Exception as e:
+            logger.exception(json.dumps({"event":"DB_FLUSH_ERROR","error":str(e)}))
+            _db_available = False
+            break
+
+# wrapper que tenta salvar e, se falhar por erro de conexão, enfileira
+async def _save_lead_resilient(payload: Dict[str, Any]):
+    global _db_available
+    if not save_lead:
+        logger.error(json.dumps({"event":"SAVE_LEAD_NOT_AVAILABLE"}))
+        return None
+    # se DB indisponível, enfileira sem tentar
+    if not _db_available:
+        await _enqueue_lead_for_db(payload)
+        return None
+
+    # tenta com retries
+    attempt = 0
+    while attempt <= DB_RETRY_ATTEMPTS:
+        try:
+            attempt += 1
+            res = await _safe_background_runner(save_lead, payload, timeout=BRIDGE_TASK_TIMEOUT, retries=0, tag="save_lead")
+            # se save_lead executou sem lançar, assumimos sucesso (save_lead pode retornar None)
+            return res
+        except Exception as e:
+            # marcaremos DB como indisponível se a exceção parecer de conexão
+            logger.warning(json.dumps({"event":"SAVE_LEAD_FAIL","attempt":attempt,"error":str(e)}))
+            # se última tentativa, enfileira
+            if attempt > DB_RETRY_ATTEMPTS:
+                _db_available = False
+                await _enqueue_lead_for_db(payload)
+                return None
+            # backoff pequeno
+            await asyncio.sleep(DB_RETRY_BACKOFF * attempt)
+    # fallback: enfileira
+    _db_available = False
+    await _enqueue_lead_for_db(payload)
+    return None
+
+# background task to monitor DB availability and flush queue
+async def _monitor_db_and_flush():
+    global _db_available
+    while True:
+        # if previously marked unavailable, try to call save_lead with a light probe
+        if not _db_available:
+            try:
+                # light probe: call save_lead with a tiny no-op payload if your save_lead supports it.
+                # If not possible, try to call save_lead on the oldest queued item.
+                async with _db_queue_lock:
+                    probe_item = _db_queue[0] if _db_queue else None
+                if probe_item:
+                    res = await _safe_background_runner(save_lead, probe_item, timeout=BRIDGE_TASK_TIMEOUT, retries=1, tag="db_probe")
+                    if res is not None:
+                        _db_available = True
+                        logger.info(json.dumps({"event":"DB_RECOVERED"}))
+                        # flush all queued items
+                        await _flush_db_queue()
+                else:
+                    # no queue to probe, try a lightweight ping if your db module exposes one - otherwise just mark available optimistically?
+                    # We'll just wait and retry later.
+                    pass
+            except Exception as e:
+                logger.debug(json.dumps({"event":"DB_PROBE_FAIL","error":str(e)}))
+                _db_available = False
+        else:
+            # if DB available and queue has items, try to flush
+            try:
+                if _db_queue:
+                    await _flush_db_queue()
+            except Exception as e:
+                logger.exception(json.dumps({"event":"DB_FLUSH_TOP_FAIL","error":str(e)}))
+                _db_available = False
+        await asyncio.sleep(3)
+
+# =============================
+# App routes
 # =============================
 @app.get("/health")
 async def health():
@@ -721,6 +837,7 @@ async def health():
         "status": "ok",
         "redis": rstatus,
         "inmem_queue_size": len(_inmem_store),
+        "db_queue_size": len(_db_queue),
         "import": {k: v for k, v in IMPORT_INFO.items() if k != "errors"},
         "ls_chosen": _ls(IMPORT_INFO.get("chosen_dir")),
     }
@@ -744,19 +861,20 @@ async def create_deeplink(
     key = _key(token)
     blob = json.dumps(data, ensure_ascii=False)
 
+    # Prefer Redis, else in-memory store; both guarded by timeout
     try:
         if _redis_client and _redis_available:
             try:
                 await _run_sync_with_timeout(lambda: _redis_client.setex(key, TOKEN_TTL_SEC, blob), timeout=1.5)
             except Exception as e:
-                logger.warning(json.dumps({"event":"REDIS_SETEX_FAIL","error":str(e)}))
+                logger.warning(json.dumps({"event": "REDIS_SETEX_FAIL", "error": str(e)}))
                 await _inmem_setex(key, TOKEN_TTL_SEC, blob)
         else:
             await _inmem_setex(key, TOKEN_TTL_SEC, blob)
     except Exception as e:
-        logger.exception(json.dumps({"event":"REDIS_SETEX_UNHANDLED","error":str(e)}))
+        logger.exception(json.dumps({"event": "REDIS_SETEX_UNHANDLED", "error": str(e)}))
 
-    # persist fbp/fbc quick keys (background)
+    # Optionally persist fbp/fbc to redis (quick TTL) to help later reads
     try:
         if BRIDGE_PERSIST_FBC_FBP:
             fbp = data.get("_fbp") or data.get("fbp")
@@ -844,8 +962,8 @@ async def ingest_event(
         logger.info(json.dumps({"event":"BRIDGE_DEDUP_SKIP","type":et,"event_id":data.get("event_id")}))
         return {"status":"duplicate","event_id":data.get("event_id")}
 
-    # fire-and-forget safe tasks
-    asyncio.create_task(_safe_background_runner(save_lead, data, timeout=BRIDGE_TASK_TIMEOUT, retries=BRIDGE_TASK_RETRY, tag="save_lead"))
+    # Fire-and-forget: save_lead resiliente + send_event_to_all (safe)
+    asyncio.create_task(_safe_background_runner(_save_lead_resilient, data, timeout=BRIDGE_TASK_TIMEOUT, retries=0, tag="save_lead_resilient"))
     asyncio.create_task(_safe_background_runner(send_event_to_all, data, timeout=BRIDGE_TASK_TIMEOUT, retries=BRIDGE_TASK_RETRY, tag="send_event_to_all"))
 
     logger.info(json.dumps({
@@ -858,6 +976,7 @@ async def ingest_event(
         "source_url": data.get("event_source_url"),
     }))
 
+    # Immediate response to avoid client timeouts
     return {"status": "ok", "saved": True, "event_type": et, "event_id": data.get("event_id")}
 
 @app.post("/webhook")
@@ -941,20 +1060,20 @@ async def apply_redirect(req: Request):
 
 # =============================
 # Periodic maintenance: verifica Redis e faz flush do inmem
+# e monitora DB para flush de leads pendentes
 # =============================
 async def _periodic_maintenance():
     global _redis_available, _redis_client
     while True:
-        # tenta reconectar / pingar
+        # tenta reconectar / pingar redis
         if _redis_client and not _redis_available:
             try:
                 await _run_sync_with_timeout(_redis_client.ping, timeout=1.0)
                 _redis_available = True
                 logger.info(json.dumps({"event":"REDIS_RECOVERED"}))
             except Exception:
-                # permanece indisponível
                 pass
-        # se disponível, flush inmem
+        # se redis disponível, flush inmem
         if _redis_client and _redis_available and _inmem_store:
             try:
                 await _flush_inmem_to_redis()
@@ -964,8 +1083,9 @@ async def _periodic_maintenance():
 
 @app.on_event("startup")
 async def _on_startup():
-    # inicia tarefa de manutenção periódica
+    # inicia tarefas de manutenção periódica e monitor DB
     asyncio.create_task(_periodic_maintenance())
+    asyncio.create_task(_monitor_db_and_flush())
     logger.info(json.dumps({"event":"BRIDGE_STARTUP"}))
 
 # fim do arquivo
