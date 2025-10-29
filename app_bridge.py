@@ -1,5 +1,5 @@
 # app_bridge.py — v5.0.0
-# Bridge otimizado: timeouts, fallback Redis->in-memory, persistência fbp/fbc, safe background tasks
+# Bridge otimizado para Railway: timeouts, fallback in-memory, persistência fbp/fbc, safe background tasks
 import os
 import sys
 import json
@@ -20,9 +20,9 @@ from cryptography.fernet import Fernet
 from fastapi.responses import RedirectResponse, JSONResponse
 from concurrent.futures import ThreadPoolExecutor
 
-# -----------------------
-# JSON logger
-# -----------------------
+# =============================
+# JSON logger (estruturado)
+# =============================
 class JSONFormatter(logging.Formatter):
     def format(self, record):
         log = {
@@ -43,9 +43,9 @@ _ch.setFormatter(JSONFormatter())
 logger.handlers = []
 logger.addHandler(_ch)
 
-# -----------------------
-# discovery (mantive tua lógica)
-# -----------------------
+# =============================
+# Descoberta dinâmica do bot_gesto (mantida)
+# =============================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
 CWD_DIR = os.getcwd()
@@ -125,7 +125,7 @@ for p in [BASE_DIR, PARENT_DIR]:
 save_lead = None
 send_event_to_all = None
 
-# try package imports first (keeps compatibility)
+# Import tentativas (preserva compatibilidade)
 try:
     import bot_gesto.db as _db1
     import bot_gesto.fb_google as _fb1
@@ -201,9 +201,9 @@ if save_lead is None or send_event_to_all is None:
 
 logger.info(json.dumps({"event": "IMPORT_OK", **{k: v for k, v in IMPORT_INFO.items() if k != 'errors'}}))
 
-# -----------------------
-# ENV / tunables
-# -----------------------
+# =============================
+# ENV / tunáveis
+# =============================
 REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 BOT_USERNAME    = os.getenv("BOT_USERNAME", "").lstrip("@")
 TOKEN_TTL_SEC   = int(os.getenv("TOKEN_TTL_SEC", "3600"))
@@ -217,12 +217,12 @@ USE_USER_AGENTS = os.getenv("USE_USER_AGENTS", "1") == "1"
 
 CONSENT_HEADER_KEYS = [h.strip() for h in (os.getenv("CONSENT_HEADER_KEYS", "X-Consent,X-TCF-String,TCF-String,GDPR-Consent") or "").split(",") if h.strip()]
 
-# Timeouts / concurrency tunables
-BRIDGE_TASK_TIMEOUT = float(os.getenv("BRIDGE_TASK_TIMEOUT", "2"))   # segundos para tarefas background críticas (<=2s recommended)
-BRIDGE_TASK_RETRY = int(os.getenv("BRIDGE_TASK_RETRY", "1"))         # retries for background tasks
-BRIDGE_MAX_WORKERS = int(os.getenv("BRIDGE_MAX_WORKERS", "8"))       # threadpool workers for to_thread
+# Timeouts / concurrency tunáveis (Railway-friendly)
+BRIDGE_TASK_TIMEOUT = float(os.getenv("BRIDGE_TASK_TIMEOUT", "2.0"))   # segundos para tarefas background críticas
+BRIDGE_TASK_RETRY = int(os.getenv("BRIDGE_TASK_RETRY", "1"))
+BRIDGE_MAX_WORKERS = int(os.getenv("BRIDGE_MAX_WORKERS", "8"))
 BRIDGE_SEMAPHORE_CONCURRENCY = int(os.getenv("BRIDGE_SEMAPHORE_CONCURRENCY", "64"))
-BRIDGE_PERSIST_FBC_FBP = os.getenv("BRIDGE_PERSIST_FBC_FBP", "1") == "1"  # persist _fbp/_fbc to redis TTL
+BRIDGE_PERSIST_FBC_FBP = os.getenv("BRIDGE_PERSIST_FBC_FBP", "1") == "1"
 
 # Crypto
 CRYPTO_KEY = os.getenv("CRYPTO_KEY")
@@ -255,25 +255,24 @@ logger.info(json.dumps({
 if not BOT_USERNAME:
     raise RuntimeError("BOT_USERNAME não configurado")
 
-# -----------------------
-# Redis client with cautious wrapper + in-memory fallback
-# -----------------------
+# =============================
+# Redis client com fallback in-memory
+# =============================
 _redis_client: Optional[Redis] = None
-_redis_available = False
+_redis_available: bool = False
 
 try:
     _redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
-    # quick ping
     _redis_client.ping()
     _redis_available = True
-    logger.info(json.dumps({"event": "REDIS_OK", "url_masked": _mask(REDIS_URL)}))
+    logger.info(json.dumps({"event":"REDIS_OK", "url_masked": _mask(REDIS_URL)}))
 except Exception as e:
     _redis_client = None
     _redis_available = False
-    logger.warning(json.dumps({"event": "REDIS_FAIL", "error": str(e)}))
+    logger.warning(json.dumps({"event":"REDIS_FAIL", "error": str(e)}))
 
-# in-memory fallback store for tokens and persistence hints
-_inmem_store: Dict[str, Tuple[float, str]] = {}        # key -> (expiry_ts, blob_json)
+# in-memory fallback store: key -> (expiry_ts, blob_json)
+_inmem_store: Dict[str, Tuple[float, str]] = {}
 _inmem_lock = asyncio.Lock()
 
 async def _inmem_setex(key: str, ttl: int, blob: str):
@@ -283,12 +282,12 @@ async def _inmem_setex(key: str, ttl: int, blob: str):
 
 async def _inmem_get(key: str) -> Optional[str]:
     async with _inmem_lock:
-        v = _inmem_store.get(key)
-        if not v:
+        tup = _inmem_store.get(key)
+        if not tup:
             return None
-        exp, blob = v
+        exp, blob = tup
         if time.time() > exp:
-            del _inmem_store[key]
+            _inmem_store.pop(key, None)
             return None
         return blob
 
@@ -296,10 +295,10 @@ async def _inmem_delete(key: str):
     async with _inmem_lock:
         _inmem_store.pop(key, None)
 
-# attempt to flush in-memory entries to redis when redis becomes available
+# flush in-memory to redis when redis recovers
 async def _flush_inmem_to_redis():
     global _redis_available, _redis_client
-    if not _redis_client:
+    if not _redis_client or not _redis_available:
         return
     async with _inmem_lock:
         keys = list(_inmem_store.keys())
@@ -311,9 +310,9 @@ async def _flush_inmem_to_redis():
                     continue
                 exp, blob = tup
                 ttl = max(1, int(exp - time.time()))
-            # sync call with small timeout
             try:
-                await _run_sync_with_timeout(lambda: _redis_client.setex(k, ttl, blob), timeout=1)
+                # small timeout guard
+                await _run_sync_with_timeout(lambda: _redis_client.setex(k, ttl, blob), timeout=1.0)
                 async with _inmem_lock:
                     _inmem_store.pop(k, None)
                 logger.info(json.dumps({"event":"FLUSH_INMEM_TO_REDIS","key":k}))
@@ -322,13 +321,13 @@ async def _flush_inmem_to_redis():
         except Exception as e:
             logger.exception(json.dumps({"event":"FLUSH_INMEM_LOOP_ERR","error":str(e)}))
 
-# ThreadPoolExecutor and semaphore for concurrency control
+# ThreadPoolExecutor + semaphore para controlar concorrência
 _executor = ThreadPoolExecutor(max_workers=BRIDGE_MAX_WORKERS)
 _task_semaphore = asyncio.Semaphore(BRIDGE_SEMAPHORE_CONCURRENCY)
 
-# -----------------------
-# GeoIP & UA parsing (kept)
-# -----------------------
+# =============================
+# GeoIP / UA (mantido)
+# =============================
 _geo_reader = None
 if GEOIP_DB_PATH and os.path.exists(GEOIP_DB_PATH):
     try:
@@ -375,9 +374,9 @@ def parse_ua(ua: Optional[str]) -> Dict[str, Any]:
             return {"ua": ua}
     return {"ua": ua}
 
-# -----------------------
+# =============================
 # FastAPI app + CORS
-# -----------------------
+# =============================
 app = FastAPI(title="Typebot Bridge", version="5.0.0")
 if ALLOWED_ORIGINS:
     app.add_middleware(
@@ -388,9 +387,9 @@ if ALLOWED_ORIGINS:
         allow_headers=["*"],
     )
 
-# -----------------------
-# util helpers
-# -----------------------
+# =============================
+# Utils locais
+# =============================
 def _merge_if_empty(dst: Dict[str, Any], src: Dict[str, Any], keys: List[str]) -> None:
     for k in keys:
         v = src.get(k)
@@ -407,9 +406,9 @@ def _set_if_blank(d: Dict[str, Any], key: str, value: Optional[str]) -> None:
     if isinstance(cur, str) and cur.strip() == "":
         d[key] = value
 
-# -----------------------
-# Pydantic schema (v2)
-# -----------------------
+# =============================
+# Schema Pydantic v2 (mantido)
+# =============================
 class TBPayload(BaseModel):
     model_config = ConfigDict(
         protected_namespaces=(),
@@ -461,9 +460,9 @@ class TBPayload(BaseModel):
     event_id: Optional[str] = None
     extra: Optional[Dict[str, Any]] = None
 
-# -----------------------
-# auth / token helpers
-# -----------------------
+# =============================
+# Auth / token helpers (mantidos)
+# =============================
 def _make_token(n: int = 16) -> str:
     return secrets.token_urlsafe(n)
 
@@ -499,12 +498,10 @@ def _auth_guard(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 def _extract_client_ip(req: Request) -> Optional[str]:
-    # Prioritize common proxy headers + Railway custom header
     for h in ("CF-Connecting-IP", "X-Real-IP", "X-Forwarded-For", "Railway-Client-IP", "X-Client-IP"):
         v = req.headers.get(h)
         if v:
             return v.split(",")[0].strip()
-    # fallback
     try:
         return req.client.host if req.client else None
     except Exception:
@@ -522,7 +519,6 @@ def _parse_cookies(header_cookie: Optional[str]) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # derive hints
     ga = out.get("_ga")
     if ga and "GA" in ga and not out.get("cid"):
         try:
@@ -549,7 +545,7 @@ def _parse_cookies(header_cookie: Optional[str]) -> Dict[str, Any]:
             out["login_id"] = out[lk]
     return out
 
-# dedupe TTL
+# ===== Dedupe leve (bridge) por event_id — TTL 10 min (mantido, adaptado para inmem)
 _BRIDGE_DEDUPE_TTL = 600
 
 def _bridge_dedupe_mark(event_id: Optional[str]) -> bool:
@@ -557,27 +553,21 @@ def _bridge_dedupe_mark(event_id: Optional[str]) -> bool:
         return True
     try:
         if _redis_client and _redis_available:
-            # prefer redis SET NX EX
             ok = _redis_client.set(f"bridge:evid:{event_id}", "1", nx=True, ex=_BRIDGE_DEDUPE_TTL)
             return bool(ok)
         else:
-            # in-memory dedupe simple (use redis-like keys)
             key = f"bridge:evid:{event_id}"
-            # reuse inmem store
-            # store small TTL in in-mem map
-            loop = asyncio.get_event_loop()
-            # synchronous path: create entry via to_thread? but quick in-memory
-            # use _inmem_store
-            exp = int(time.time() + _BRIDGE_DEDUPE_TTL)
-            # direct write (not awaited) — safe since single-threaded
+            # grava no inmem store com TTL
+            exp = time.time() + _BRIDGE_DEDUPE_TTL
+            # operação síncrona leve (único processo)
             _inmem_store[key] = (exp, "1")
             return True
     except Exception:
         return True
 
-# -----------------------
-# enrichment
-# -----------------------
+# =============================
+# Enriquecimento first-party (mantido)
+# =============================
 def _extract_consent(req: Request, data: Dict[str, Any]) -> Dict[str, Any]:
     consent: Dict[str, Any] = dict(data.get("consent") or {})
     for hk in CONSENT_HEADER_KEYS:
@@ -596,7 +586,6 @@ def _extract_consent(req: Request, data: Dict[str, Any]) -> Dict[str, Any]:
 def _enrich_payload(data: dict, req: Request) -> dict:
     data = dict(data or {})
 
-    # normalize fbp/fbc
     co_fbp = data.get("_fbp") or data.get("fbp")
     co_fbc = data.get("_fbc") or data.get("fbc")
     if co_fbp:
@@ -675,9 +664,9 @@ def _enrich_payload(data: dict, req: Request) -> dict:
 
     return data
 
-# -----------------------
-# safe running utils (timeouts + retry)
-# -----------------------
+# =============================
+# Helpers safe run (timeouts + retry)
+# =============================
 async def _run_sync_with_timeout(fn: Callable, *args, timeout: float = BRIDGE_TASK_TIMEOUT, **kwargs):
     loop = asyncio.get_running_loop()
     try:
@@ -714,16 +703,15 @@ async def _safe_background_runner(fn: Callable, *args, timeout: float = BRIDGE_T
     logger.error(json.dumps({"event": "TASK_FAILED", "tag": tag, "attempts": attempt, "error": str(exc)}))
     return None
 
-# -----------------------
-# App routes
-# -----------------------
+# =============================
+# Rotas (mantidas, com melhorias de timeout/fallback)
+# =============================
 @app.get("/health")
 async def health():
-    # test redis quickly
     rstatus = "disabled"
     try:
         if _redis_client:
-            ok = await _run_sync_with_timeout(_redis_client.ping, timeout=1)
+            ok = await _run_sync_with_timeout(_redis_client.ping, timeout=1.0)
             rstatus = "ok" if ok else "error"
         else:
             rstatus = "unavailable"
@@ -756,27 +744,24 @@ async def create_deeplink(
     key = _key(token)
     blob = json.dumps(data, ensure_ascii=False)
 
-    # Prefer Redis, else in-memory store; both guarded by timeout
     try:
         if _redis_client and _redis_available:
             try:
                 await _run_sync_with_timeout(lambda: _redis_client.setex(key, TOKEN_TTL_SEC, blob), timeout=1.5)
             except Exception as e:
-                logger.warning(json.dumps({"event": "REDIS_SETEX_FAIL", "error": str(e)}))
-                # fallback to in-memory
+                logger.warning(json.dumps({"event":"REDIS_SETEX_FAIL","error":str(e)}))
                 await _inmem_setex(key, TOKEN_TTL_SEC, blob)
         else:
             await _inmem_setex(key, TOKEN_TTL_SEC, blob)
     except Exception as e:
-        logger.exception(json.dumps({"event": "REDIS_SETEX_UNHANDLED", "error": str(e)}))
-        # still return token (bridge will log)
-    # Optionally persist fbp/fbc to redis (quick TTL) to help later reads
+        logger.exception(json.dumps({"event":"REDIS_SETEX_UNHANDLED","error":str(e)}))
+
+    # persist fbp/fbc quick keys (background)
     try:
         if BRIDGE_PERSIST_FBC_FBP:
             fbp = data.get("_fbp") or data.get("fbp")
             fbc = data.get("_fbc") or data.get("fbc")
             if (fbp or fbc) and (_redis_client and _redis_available):
-                # persist in separate keys (no blocking main flow)
                 async def _persist_fbkeys():
                     try:
                         if fbp:
@@ -859,7 +844,7 @@ async def ingest_event(
         logger.info(json.dumps({"event":"BRIDGE_DEDUP_SKIP","type":et,"event_id":data.get("event_id")}))
         return {"status":"duplicate","event_id":data.get("event_id")}
 
-    # Fire-and-forget background tasks with safe wrapper
+    # fire-and-forget safe tasks
     asyncio.create_task(_safe_background_runner(save_lead, data, timeout=BRIDGE_TASK_TIMEOUT, retries=BRIDGE_TASK_RETRY, tag="save_lead"))
     asyncio.create_task(_safe_background_runner(send_event_to_all, data, timeout=BRIDGE_TASK_TIMEOUT, retries=BRIDGE_TASK_RETRY, tag="send_event_to_all"))
 
@@ -873,7 +858,6 @@ async def ingest_event(
         "source_url": data.get("event_source_url"),
     }))
 
-    # immediate response to avoid client timeouts
     return {"status": "ok", "saved": True, "event_type": et, "event_id": data.get("event_id")}
 
 @app.post("/webhook")
@@ -944,7 +928,6 @@ async def apply_redirect(req: Request):
     except Exception as e:
         logger.exception(json.dumps({"event":"REDIS_SETEX_UNHANDLED","error":str(e)}))
 
-    # log minimal
     logger.info(json.dumps({
         "event": "APPLY_REDIRECT",
         "token": token,
@@ -954,23 +937,24 @@ async def apply_redirect(req: Request):
         "has_fbc": bool(data.get("_fbc") or data.get("fbc")),
     }))
 
-    # redirect to deep link (Telegram)
     return RedirectResponse(url=_deep_link(token))
 
-# -----------------------
-# periodic background: try to flush inmem -> redis periodically
-# -----------------------
+# =============================
+# Periodic maintenance: verifica Redis e faz flush do inmem
+# =============================
 async def _periodic_maintenance():
+    global _redis_available, _redis_client
     while True:
+        # tenta reconectar / pingar
         if _redis_client and not _redis_available:
             try:
-                _redis_client.ping()
-                # if ping ok, mark available
-                logger.info(json.dumps({"event":"REDIS_RECOVERED"}))
-                global _redis_available
+                await _run_sync_with_timeout(_redis_client.ping, timeout=1.0)
                 _redis_available = True
+                logger.info(json.dumps({"event":"REDIS_RECOVERED"}))
             except Exception:
+                # permanece indisponível
                 pass
+        # se disponível, flush inmem
         if _redis_client and _redis_available and _inmem_store:
             try:
                 await _flush_inmem_to_redis()
@@ -980,8 +964,8 @@ async def _periodic_maintenance():
 
 @app.on_event("startup")
 async def _on_startup():
-    # spawn maintenance task
+    # inicia tarefa de manutenção periódica
     asyncio.create_task(_periodic_maintenance())
     logger.info(json.dumps({"event":"BRIDGE_STARTUP"}))
 
-# End of file
+# fim do arquivo
