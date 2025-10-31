@@ -1,28 +1,18 @@
-# app_bridge.py — v5.0.1
-# Bridge otimizado para Railway: timeouts, fallback in-memory, persistência fbp/fbc, safe background tasks
-# Adição: resiliência DB (fila in-memory para leads pendentes + flush automatico)
-import os
-import sys
-import json
-import time
-import secrets
-import logging
-import asyncio
-import base64
-import hashlib
-import importlib.util
-from typing import Optional, Dict, Any, List, Tuple, Callable
+# =============================
+# app_bridge.py — v4.2.1 (Bridge first-party; AM-friendly; dedupe por event_id; Pydantic v2 safe; sem dados fake)
+# =============================
+import os, sys, json, time, secrets, logging, asyncio, base64, hashlib, importlib.util
+from typing import Optional, Dict, Any, List, Tuple
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydantic import ConfigDict
-from redis import Redis, RedisError
+from redis import Redis
 from cryptography.fernet import Fernet
-from fastapi.responses import RedirectResponse, JSONResponse
-from concurrent.futures import ThreadPoolExecutor
+from fastapi.responses import RedirectResponse
 
 # =============================
-# JSON logger (estruturado)
+# Logging JSON estruturado
 # =============================
 class JSONFormatter(logging.Formatter):
     def format(self, record):
@@ -36,16 +26,14 @@ class JSONFormatter(logging.Formatter):
             log["exc_info"] = self.formatException(record.exc_info)
         return json.dumps(log, ensure_ascii=False)
 
-LOG_LEVEL = os.getenv("BRIDGE_LOG_LEVEL", "INFO")
 logger = logging.getLogger("bridge")
-logger.setLevel(LOG_LEVEL)
+logger.setLevel(logging.INFO)
 _ch = logging.StreamHandler()
 _ch.setFormatter(JSONFormatter())
-logger.handlers = []
 logger.addHandler(_ch)
 
 # =============================
-# Descoberta dinâmica do bot_gesto (mantida)
+# Descoberta dinâmica do bot_gesto
 # =============================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
@@ -126,7 +114,7 @@ for p in [BASE_DIR, PARENT_DIR]:
 save_lead = None
 send_event_to_all = None
 
-# Import tentativas (preserva compatibilidade)
+# Import como pacote
 try:
     import bot_gesto.db as _db1
     import bot_gesto.fb_google as _fb1
@@ -141,6 +129,7 @@ try:
 except Exception as e1:
     IMPORT_INFO["errors"].append(f"pkg bot_gesto: {e1}")
 
+# Import alternativo
 if save_lead is None or send_event_to_all is None:
     try:
         import typebot_conection.bot_gesto.db as _db2
@@ -156,6 +145,7 @@ if save_lead is None or send_event_to_all is None:
     except Exception as e2:
         IMPORT_INFO["errors"].append(f"pkg typebot_conection.bot_gesto: {e2}")
 
+# Import por caminho
 if save_lead is None or send_event_to_all is None:
     candidates = [
         ENV_DIR,
@@ -203,7 +193,7 @@ if save_lead is None or send_event_to_all is None:
 logger.info(json.dumps({"event": "IMPORT_OK", **{k: v for k, v in IMPORT_INFO.items() if k != 'errors'}}))
 
 # =============================
-# ENV / tunáveis
+# ENV Bridge
 # =============================
 REDIS_URL       = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 BOT_USERNAME    = os.getenv("BOT_USERNAME", "").lstrip("@")
@@ -218,24 +208,13 @@ USE_USER_AGENTS = os.getenv("USE_USER_AGENTS", "1") == "1"
 
 CONSENT_HEADER_KEYS = [h.strip() for h in (os.getenv("CONSENT_HEADER_KEYS", "X-Consent,X-TCF-String,TCF-String,GDPR-Consent") or "").split(",") if h.strip()]
 
-# Timeouts / concurrency tunáveis (Railway-friendly)
-BRIDGE_TASK_TIMEOUT = float(os.getenv("BRIDGE_TASK_TIMEOUT", "2.0"))   # segundos para tarefas background críticas
-BRIDGE_TASK_RETRY = int(os.getenv("BRIDGE_TASK_RETRY", "1"))
-BRIDGE_MAX_WORKERS = int(os.getenv("BRIDGE_MAX_WORKERS", "8"))
-BRIDGE_SEMAPHORE_CONCURRENCY = int(os.getenv("BRIDGE_SEMAPHORE_CONCURRENCY", "64"))
-BRIDGE_PERSIST_FBC_FBP = os.getenv("BRIDGE_PERSIST_FBC_FBP", "1") == "1"
-
-# DB retry tunables
-DB_RETRY_ATTEMPTS = int(os.getenv("DB_RETRY_ATTEMPTS", "3"))
-DB_RETRY_BACKOFF = float(os.getenv("DB_RETRY_BACKOFF", "0.5"))  # base backoff seconds
-
 # Crypto
 CRYPTO_KEY = os.getenv("CRYPTO_KEY")
 fernet = None
 if CRYPTO_KEY:
     derived = base64.urlsafe_b64encode(hashlib.sha256(CRYPTO_KEY.encode()).digest())
     fernet = Fernet(derived)
-    logger.info(json.dumps({"event":"CRYPTO_ENABLED"}))
+    logger.info("✅ Cripto: Fernet habilitado")
 
 def _mask(v: str) -> str:
     if not v:
@@ -252,95 +231,24 @@ logger.info(json.dumps({
     "bridge_token_masked": _mask(BRIDGE_TOKEN),
     "bot_username_set": bool(BOT_USERNAME),
     "allowed_origins": ALLOWED_ORIGINS,
-    "task_timeout": BRIDGE_TASK_TIMEOUT,
-    "task_retry": BRIDGE_TASK_RETRY,
-    "persist_fbp_fbc": BRIDGE_PERSIST_FBC_FBP,
 }))
 
 if not BOT_USERNAME:
     raise RuntimeError("BOT_USERNAME não configurado")
 
-# =============================
-# Redis client com fallback in-memory
-# =============================
-_redis_client: Optional[Redis] = None
-_redis_available: bool = False
-
-try:
-    _redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
-    _redis_client.ping()
-    _redis_available = True
-    logger.info(json.dumps({"event":"REDIS_OK", "url_masked": _mask(REDIS_URL)}))
-except Exception as e:
-    _redis_client = None
-    _redis_available = False
-    logger.warning(json.dumps({"event":"REDIS_FAIL", "error": str(e)}))
-
-# in-memory fallback store: key -> (expiry_ts, blob_json)
-_inmem_store: Dict[str, Tuple[float, str]] = {}
-_inmem_lock = asyncio.Lock()
-
-async def _inmem_setex(key: str, ttl: int, blob: str):
-    async with _inmem_lock:
-        _inmem_store[key] = (time.time() + ttl, blob)
-    return True
-
-async def _inmem_get(key: str) -> Optional[str]:
-    async with _inmem_lock:
-        tup = _inmem_store.get(key)
-        if not tup:
-            return None
-        exp, blob = tup
-        if time.time() > exp:
-            _inmem_store.pop(key, None)
-            return None
-        return blob
-
-async def _inmem_delete(key: str):
-    async with _inmem_lock:
-        _inmem_store.pop(key, None)
-
-# flush in-memory to redis when redis recovers
-async def _flush_inmem_to_redis():
-    global _redis_available, _redis_client
-    if not _redis_client or not _redis_available:
-        return
-    async with _inmem_lock:
-        keys = list(_inmem_store.keys())
-    for k in keys:
-        try:
-            async with _inmem_lock:
-                tup = _inmem_store.get(k)
-                if not tup:
-                    continue
-                exp, blob = tup
-                ttl = max(1, int(exp - time.time()))
-            try:
-                # small timeout guard
-                await _run_sync_with_timeout(lambda: _redis_client.setex(k, ttl, blob), timeout=1.0)
-                async with _inmem_lock:
-                    _inmem_store.pop(k, None)
-                logger.info(json.dumps({"event":"FLUSH_INMEM_TO_REDIS","key":k}))
-            except Exception as e:
-                logger.warning(json.dumps({"event":"FLUSH_REDIS_FAIL","key":k,"error":str(e)}))
-        except Exception as e:
-            logger.exception(json.dumps({"event":"FLUSH_INMEM_LOOP_ERR","error":str(e)}))
-
-# ThreadPoolExecutor + semaphore para controlar concorrência
-_executor = ThreadPoolExecutor(max_workers=BRIDGE_MAX_WORKERS)
-_task_semaphore = asyncio.Semaphore(BRIDGE_SEMAPHORE_CONCURRENCY)
+redis = Redis.from_url(REDIS_URL, decode_responses=True)
 
 # =============================
-# GeoIP / UA (mantido)
+# GeoIP / UA
 # =============================
 _geo_reader = None
 if GEOIP_DB_PATH and os.path.exists(GEOIP_DB_PATH):
     try:
         import geoip2.database
         _geo_reader = geoip2.database.Reader(GEOIP_DB_PATH)
-        logger.info(json.dumps({"event":"GEOIP_ENABLED"}))
+        logger.info("🌎 GeoIP habilitado")
     except Exception as e:
-        logger.warning(json.dumps({"event":"GEOIP_FAIL","error":str(e)}))
+        logger.warning(f"⚠️ GeoIP indisponível: {e}")
 
 def geo_lookup(ip: str) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
@@ -380,9 +288,9 @@ def parse_ua(ua: Optional[str]) -> Dict[str, Any]:
     return {"ua": ua}
 
 # =============================
-# FastAPI app + CORS
+# App FastAPI
 # =============================
-app = FastAPI(title="Typebot Bridge", version="5.0.1")
+app = FastAPI(title="Typebot Bridge", version="4.2.1")
 if ALLOWED_ORIGINS:
     app.add_middleware(
         CORSMiddleware,
@@ -412,15 +320,16 @@ def _set_if_blank(d: Dict[str, Any], key: str, value: Optional[str]) -> None:
         d[key] = value
 
 # =============================
-# Schema Pydantic v2 (mantido)
+# Schema
 # =============================
 class TBPayload(BaseModel):
     model_config = ConfigDict(
-        protected_namespaces=(),
+        protected_namespaces=(),   # permite campos iniciados com "_"
         populate_by_name=True,
-        extra="allow"
+        extra="allow"              # guarda fbp/fbc sem underscore como extra
     )
 
+    # IDs/click-ids — mantemos alias simples para _fbp/_fbc
     fbp: Optional[str] = Field(default=None, alias="_fbp")
     fbc: Optional[str] = Field(default=None, alias="_fbc")
     fbclid: Optional[str] = None
@@ -429,6 +338,7 @@ class TBPayload(BaseModel):
     wbraid: Optional[str] = None
     cid: Optional[str] = None
 
+    # URLs/tráfego
     landing_url: Optional[str] = None
     event_source_url: Optional[str] = None
     utm_source: Optional[str] = None
@@ -437,12 +347,14 @@ class TBPayload(BaseModel):
     utm_term: Optional[str] = None
     utm_content: Optional[str] = None
 
+    # Device/UA
     device: Optional[str] = None
     os: Optional[str] = None
     user_agent: Optional[str] = None
     browser: Optional[str] = None
     platform: Optional[str] = None
 
+    # User
     email: Optional[str] = None
     phone: Optional[str] = None
     first_name: Optional[str] = None
@@ -452,21 +364,25 @@ class TBPayload(BaseModel):
     zip: Optional[str] = None
     country: Optional[str] = None
 
+    # Valores
     value: Optional[float] = None
     currency: Optional[str] = None
 
+    # IDs de usuário
     telegram_id: Optional[str] = None
     external_id: Optional[str] = None
     login_id: Optional[str] = None
 
+    # Consent
     consent: Optional[Dict[str, Any]] = None
 
+    # Controle / Evento
     event: Optional[str] = None
     event_id: Optional[str] = None
     extra: Optional[Dict[str, Any]] = None
 
 # =============================
-# Auth / token helpers (mantidos)
+# Auth / tokens / consent helpers
 # =============================
 def _make_token(n: int = 16) -> str:
     return secrets.token_urlsafe(n)
@@ -503,14 +419,11 @@ def _auth_guard(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 def _extract_client_ip(req: Request) -> Optional[str]:
-    for h in ("CF-Connecting-IP", "X-Real-IP", "X-Forwarded-For", "Railway-Client-IP", "X-Client-IP"):
+    for h in ["CF-Connecting-IP", "X-Real-IP", "X-Forwarded-For"]:
         v = req.headers.get(h)
         if v:
             return v.split(",")[0].strip()
-    try:
-        return req.client.host if req.client else None
-    except Exception:
-        return None
+    return req.client.host if req.client else None
 
 def _parse_cookies(header_cookie: Optional[str]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
@@ -524,6 +437,7 @@ def _parse_cookies(header_cookie: Optional[str]) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # Hints: _ga -> cid_hint
     ga = out.get("_ga")
     if ga and "GA" in ga and not out.get("cid"):
         try:
@@ -533,6 +447,7 @@ def _parse_cookies(header_cookie: Optional[str]) -> Dict[str, Any]:
         except Exception:
             pass
 
+    # GCLID em _gcl_*
     if not out.get("gclid"):
         for k in ("_gcl_au", "_gcl_aw", "_gcl_dc"):
             g = out.get(k)
@@ -545,31 +460,27 @@ def _parse_cookies(header_cookie: Optional[str]) -> Dict[str, Any]:
                 except Exception:
                     pass
 
+    # login id
     for lk in ("login_id", "uid", "user_id"):
         if out.get(lk) and not out.get("login_id"):
             out["login_id"] = out[lk]
     return out
 
-# ===== Dedupe leve (bridge) por event_id — TTL 10 min (mantido, adaptado para inmem)
+# ===== Dedupe leve (bridge) por event_id — TTL 10 min =====
 _BRIDGE_DEDUPE_TTL = 600
 
 def _bridge_dedupe_mark(event_id: Optional[str]) -> bool:
     if not event_id or (isinstance(event_id, str) and event_id.strip() == ""):
         return True
     try:
-        if _redis_client and _redis_available:
-            ok = _redis_client.set(f"bridge:evid:{event_id}", "1", nx=True, ex=_BRIDGE_DEDUPE_TTL)
-            return bool(ok)
-        else:
-            key = f"bridge:evid:{event_id}"
-            exp = time.time() + _BRIDGE_DEDUPE_TTL
-            _inmem_store[key] = (exp, "1")
+        if redis.set(f"bridge:evid:{event_id}", "1", nx=True, ex=_BRIDGE_DEDUPE_TTL):
             return True
+        return False
     except Exception:
         return True
 
 # =============================
-# Enriquecimento first-party (mantido)
+# Enriquecimento first-party
 # =============================
 def _extract_consent(req: Request, data: Dict[str, Any]) -> Dict[str, Any]:
     consent: Dict[str, Any] = dict(data.get("consent") or {})
@@ -587,8 +498,16 @@ def _extract_consent(req: Request, data: Dict[str, Any]) -> Dict[str, Any]:
     return consent
 
 def _enrich_payload(data: dict, req: Request) -> dict:
+    """
+    - Normaliza fbp/fbc -> _fbp/_fbc
+    - IP/UA reais (não sobrescreve se já vieram válidos)
+    - Deriva _fbc de fbclid
+    - Cookies/_ga/_gcl* hints
+    - login_id->external_id fallback
+    """
     data = dict(data or {})
 
+    # Normalização fbp/fbc
     co_fbp = data.get("_fbp") or data.get("fbp")
     co_fbc = data.get("_fbc") or data.get("fbc")
     if co_fbp:
@@ -598,11 +517,13 @@ def _enrich_payload(data: dict, req: Request) -> dict:
         data["_fbc"] = co_fbc
         data["fbc"] = co_fbc
 
+    # extra.login_id/external_id
     extra = data.get("extra") if isinstance(data.get("extra"), dict) else {}
     for k in ("login_id", "external_id"):
         if not data.get(k) and extra.get(k):
             data[k] = extra[k]
 
+    # Referer -> event_source_url (fallback)
     referer = req.headers.get("Referer") or req.headers.get("referer")
     if not data.get("event_source_url") and referer:
         data["event_source_url"] = referer
@@ -611,19 +532,23 @@ def _enrich_payload(data: dict, req: Request) -> dict:
     ua = data.get("user_agent") or req.headers.get("user-agent")
     ck = _parse_cookies(req.headers.get("cookie"))
 
+    # Cookies -> corpo
     _merge_if_empty(data, ck, ["_fbp", "_fbc", "cid", "login_id"])
     if ck.get("cid_hint") and not data.get("cid"):
         data["cid"] = ck["cid_hint"]
     if ck.get("gclid_hint") and not data.get("gclid"):
         data["gclid"] = ck["gclid_hint"]
 
+    # _fbc de fbclid
     if data.get("fbclid") and not data.get("_fbc"):
         data["_fbc"] = f"fb.1.{int(time.time())}.{data['fbclid']}"
         data["fbc"] = data["_fbc"]
 
+    # CID de gclid (GA4)
     if not data.get("cid") and data.get("gclid"):
         data["cid"] = f"gclid.{data['gclid']}"
 
+    # IP/Geo
     _set_if_blank(data, "ip", ip)
     if data.get("ip"):
         geo = geo_lookup(data["ip"])
@@ -633,11 +558,13 @@ def _enrich_payload(data: dict, req: Request) -> dict:
             data.setdefault("city", data.get("city") or geo.get("city"))
             data.setdefault("state", data.get("state") or geo.get("region"))
 
+    # UA/Device
     ua_info = parse_ua(ua)
     if ua_info:
         _set_if_blank(data, "user_agent", ua_info.get("ua"))
         _merge_if_empty(data, ua_info, ["device", "os", "browser"])
 
+    # login_id de header/QS
     hdr_login = req.headers.get("X-Login-Id") or req.headers.get("x-login-id")
     if hdr_login and not data.get("login_id"):
         data["login_id"] = hdr_login
@@ -645,10 +572,14 @@ def _enrich_payload(data: dict, req: Request) -> dict:
     if qs.get("login_id") and not data.get("login_id"):
         data["login_id"] = qs.get("login_id")
 
+    # external_id ← login_id
     if data.get("login_id") and not data.get("external_id"):
         data["external_id"] = data["login_id"]
 
+    # consent
     data["consent"] = _extract_consent(req, data)
+
+    # ts
     data.setdefault("ts", int(time.time()))
 
     logger.info(json.dumps({
@@ -667,177 +598,24 @@ def _enrich_payload(data: dict, req: Request) -> dict:
 
     return data
 
-# =============================
-# Helpers safe run (timeouts + retry)
-# =============================
-async def _run_sync_with_timeout(fn: Callable, *args, timeout: float = BRIDGE_TASK_TIMEOUT, **kwargs):
-    loop = asyncio.get_running_loop()
-    try:
-        return await asyncio.wait_for(loop.run_in_executor(_executor, lambda: fn(*args, **kwargs)), timeout=timeout)
-    except asyncio.TimeoutError:
-        raise
-
-async def _run_coro_with_timeout(coro, timeout: float = BRIDGE_TASK_TIMEOUT):
-    try:
-        return await asyncio.wait_for(coro, timeout=timeout)
-    except asyncio.TimeoutError:
-        raise
-
-async def _safe_background_runner(fn: Callable, *args, timeout: float = BRIDGE_TASK_TIMEOUT, retries: int = BRIDGE_TASK_RETRY, tag: str = "task"):
-    attempt = 0
-    exc = None
-    while attempt <= retries:
-        try:
-            attempt += 1
-            async with _task_semaphore:
-                if asyncio.iscoroutinefunction(fn):
-                    coro = fn(*args)
-                    return await _run_coro_with_timeout(coro, timeout=timeout)
-                else:
-                    return await _run_sync_with_timeout(fn, *args, timeout=timeout)
-        except asyncio.TimeoutError:
-            logger.warning(json.dumps({"event": "TASK_TIMEOUT", "tag": tag, "attempt": attempt, "timeout": timeout}))
-            exc = asyncio.TimeoutError()
-        except Exception as e:
-            logger.exception(json.dumps({"event": "TASK_ERROR", "tag": tag, "attempt": attempt, "error": str(e)}))
-            exc = e
-        if attempt <= retries:
-            await asyncio.sleep(0.25 * attempt)
-    logger.error(json.dumps({"event": "TASK_FAILED", "tag": tag, "attempts": attempt, "error": str(exc)}))
-    return None
+async def _maybe_async(fn, *args, **kwargs):
+    res = fn(*args, **kwargs)
+    if asyncio.iscoroutine(res):
+        return await res
+    return res
 
 # =============================
-# DB resilience: fila de leads pendentes (in-memory) + wrapper save_lead
-# =============================
-_db_available: bool = True  # assume true until we detect otherwise
-_db_queue: List[Dict[str, Any]] = []
-_db_queue_lock = asyncio.Lock()
-
-async def _enqueue_lead_for_db(payload: Dict[str, Any]):
-    async with _db_queue_lock:
-        _db_queue.append(payload)
-        logger.warning(json.dumps({"event":"DB_ENQUEUE","queue_length": len(_db_queue)}))
-
-async def _flush_db_queue():
-    """
-    Tenta salvar os leads pendentes usando save_lead.
-    Faz backoff simples entre tentativas.
-    """
-    global _db_available
-    if not save_lead:
-        return
-    async with _db_queue_lock:
-        queue_copy = list(_db_queue)
-    if not queue_copy:
-        return
-
-    for idx, item in enumerate(queue_copy):
-        try:
-            # chama save_lead com timeout e retries
-            res = await _safe_background_runner(save_lead, item, timeout=BRIDGE_TASK_TIMEOUT, retries=DB_RETRY_ATTEMPTS, tag="flush_save_lead")
-            # se retornou None -> possivelmente falhou; nesse caso, interrompe flush para evitar loop agressivo
-            if res is None:
-                logger.warning(json.dumps({"event":"DB_FLUSH_PARTIAL","idx": idx}))
-                _db_available = False
-                break
-            # se ok, remove do queue
-            async with _db_queue_lock:
-                if item in _db_queue:
-                    _db_queue.remove(item)
-            logger.info(json.dumps({"event":"DB_FLUSHED_ONE","remaining": len(_db_queue)}))
-        except Exception as e:
-            logger.exception(json.dumps({"event":"DB_FLUSH_ERROR","error":str(e)}))
-            _db_available = False
-            break
-
-# wrapper que tenta salvar e, se falhar por erro de conexão, enfileira
-async def _save_lead_resilient(payload: Dict[str, Any]):
-    global _db_available
-    if not save_lead:
-        logger.error(json.dumps({"event":"SAVE_LEAD_NOT_AVAILABLE"}))
-        return None
-    # se DB indisponível, enfileira sem tentar
-    if not _db_available:
-        await _enqueue_lead_for_db(payload)
-        return None
-
-    # tenta com retries
-    attempt = 0
-    while attempt <= DB_RETRY_ATTEMPTS:
-        try:
-            attempt += 1
-            res = await _safe_background_runner(save_lead, payload, timeout=BRIDGE_TASK_TIMEOUT, retries=0, tag="save_lead")
-            # se save_lead executou sem lançar, assumimos sucesso (save_lead pode retornar None)
-            return res
-        except Exception as e:
-            # marcaremos DB como indisponível se a exceção parecer de conexão
-            logger.warning(json.dumps({"event":"SAVE_LEAD_FAIL","attempt":attempt,"error":str(e)}))
-            # se última tentativa, enfileira
-            if attempt > DB_RETRY_ATTEMPTS:
-                _db_available = False
-                await _enqueue_lead_for_db(payload)
-                return None
-            # backoff pequeno
-            await asyncio.sleep(DB_RETRY_BACKOFF * attempt)
-    # fallback: enfileira
-    _db_available = False
-    await _enqueue_lead_for_db(payload)
-    return None
-
-# background task to monitor DB availability and flush queue
-async def _monitor_db_and_flush():
-    global _db_available
-    while True:
-        # if previously marked unavailable, try to call save_lead with a light probe
-        if not _db_available:
-            try:
-                # light probe: call save_lead with a tiny no-op payload if your save_lead supports it.
-                # If not possible, try to call save_lead on the oldest queued item.
-                async with _db_queue_lock:
-                    probe_item = _db_queue[0] if _db_queue else None
-                if probe_item:
-                    res = await _safe_background_runner(save_lead, probe_item, timeout=BRIDGE_TASK_TIMEOUT, retries=1, tag="db_probe")
-                    if res is not None:
-                        _db_available = True
-                        logger.info(json.dumps({"event":"DB_RECOVERED"}))
-                        # flush all queued items
-                        await _flush_db_queue()
-                else:
-                    # no queue to probe, try a lightweight ping if your db module exposes one - otherwise just mark available optimistically?
-                    # We'll just wait and retry later.
-                    pass
-            except Exception as e:
-                logger.debug(json.dumps({"event":"DB_PROBE_FAIL","error":str(e)}))
-                _db_available = False
-        else:
-            # if DB available and queue has items, try to flush
-            try:
-                if _db_queue:
-                    await _flush_db_queue()
-            except Exception as e:
-                logger.exception(json.dumps({"event":"DB_FLUSH_TOP_FAIL","error":str(e)}))
-                _db_available = False
-        await asyncio.sleep(3)
-
-# =============================
-# App routes
+# Rotas
 # =============================
 @app.get("/health")
-async def health():
-    rstatus = "disabled"
+def health():
     try:
-        if _redis_client:
-            ok = await _run_sync_with_timeout(_redis_client.ping, timeout=1.0)
-            rstatus = "ok" if ok else "error"
-        else:
-            rstatus = "unavailable"
+        redis.ping(); rstatus = "ok"
     except Exception as e:
-        rstatus = f"error: {str(e)}"
+        rstatus = f"error: {e}"
     return {
         "status": "ok",
         "redis": rstatus,
-        "inmem_queue_size": len(_inmem_store),
-        "db_queue_size": len(_db_queue),
         "import": {k: v for k, v in IMPORT_INFO.items() if k != "errors"},
         "ls_chosen": _ls(IMPORT_INFO.get("chosen_dir")),
     }
@@ -855,92 +633,35 @@ async def create_deeplink(
     x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
 ):
     _auth_guard(x_api_key, x_bridge_token, authorization)
+    # Pydantic v2
     payload = body.model_dump(by_alias=True, exclude_none=True)
     data = _enrich_payload(payload, req)
     token = _make_token()
-    key = _key(token)
-    blob = json.dumps(data, ensure_ascii=False)
-
-    # Prefer Redis, else in-memory store; both guarded by timeout
-    try:
-        if _redis_client and _redis_available:
-            try:
-                await _run_sync_with_timeout(lambda: _redis_client.setex(key, TOKEN_TTL_SEC, blob), timeout=1.5)
-            except Exception as e:
-                logger.warning(json.dumps({"event": "REDIS_SETEX_FAIL", "error": str(e)}))
-                await _inmem_setex(key, TOKEN_TTL_SEC, blob)
-        else:
-            await _inmem_setex(key, TOKEN_TTL_SEC, blob)
-    except Exception as e:
-        logger.exception(json.dumps({"event": "REDIS_SETEX_UNHANDLED", "error": str(e)}))
-
-    # Optionally persist fbp/fbc to redis (quick TTL) to help later reads
-    try:
-        if BRIDGE_PERSIST_FBC_FBP:
-            fbp = data.get("_fbp") or data.get("fbp")
-            fbc = data.get("_fbc") or data.get("fbc")
-            if (fbp or fbc) and (_redis_client and _redis_available):
-                async def _persist_fbkeys():
-                    try:
-                        if fbp:
-                            _redis_client.setex(f"fbp:{fbp}", 3600, json.dumps({"ts": int(time.time())}))
-                        if fbc:
-                            _redis_client.setex(f"fbc:{fbc}", 3600, json.dumps({"ts": int(time.time())}))
-                    except Exception as e:
-                        logger.warning(json.dumps({"event":"PERSIST_FB_FAIL","error":str(e)}))
-                asyncio.create_task(_safe_background_runner(_persist_fbkeys, timeout=1.0, tag="persist_fbkeys"))
-    except Exception:
-        pass
-
+    redis.setex(_key(token), TOKEN_TTL_SEC, json.dumps(data, ensure_ascii=False))
     return {"deep_link": _deep_link(token), "token": token, "expires_in": TOKEN_TTL_SEC}
 
 @app.get("/tb/peek/{token}")
-async def peek_token(
+def peek_token(
     token: str,
     x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
     authorization: Optional[str] = Header(default=None),
     x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
 ):
     _auth_guard(x_api_key, x_bridge_token, authorization)
-    key = _key(token)
-    blob = None
-    try:
-        if _redis_client and _redis_available:
-            try:
-                blob = await _run_sync_with_timeout(lambda: _redis_client.get(key), timeout=1.0)
-            except Exception as e:
-                logger.warning(json.dumps({"event":"REDIS_GET_FAIL","error":str(e)}))
-                blob = None
-        if not blob:
-            blob = await _inmem_get(key)
-    except Exception as e:
-        logger.exception(json.dumps({"event":"PEEK_FAIL","error":str(e)}))
-        raise HTTPException(status_code=500, detail="internal error")
+    blob = redis.get(_key(token))
     if not blob:
         raise HTTPException(status_code=404, detail="token not found/expired")
     return {"token": token, "payload": json.loads(blob)}
 
 @app.delete("/tb/del/{token}")
-async def delete_token(
+def delete_token(
     token: str,
     x_api_key: Optional[str] = Header(default=None, convert_underscores=False),
     authorization: Optional[str] = Header(default=None),
     x_bridge_token: Optional[str] = Header(default=None, alias="X-Bridge-Token", convert_underscores=False),
 ):
     _auth_guard(x_api_key, x_bridge_token, authorization)
-    key = _key(token)
-    try:
-        if _redis_client and _redis_available:
-            try:
-                await _run_sync_with_timeout(lambda: _redis_client.delete(key), timeout=1.0)
-            except Exception as e:
-                logger.warning(json.dumps({"event":"REDIS_DEL_FAIL","error":str(e)}))
-                await _inmem_delete(key)
-        else:
-            await _inmem_delete(key)
-    except Exception as e:
-        logger.exception(json.dumps({"event":"DEL_FAIL","error":str(e)}))
-        raise HTTPException(status_code=500, detail="internal error")
+    redis.delete(_key(token))
     return {"deleted": True, "token": token}
 
 @app.post("/event")
@@ -953,18 +674,22 @@ async def ingest_event(
     event_type: Optional[str] = "Lead"
 ):
     _auth_guard(x_api_key, x_bridge_token, authorization)
-    payload = body.model_dump(by_alias=True, exclude_none=True)
+    payload = body.model_dump(by_alias=True, exclude_none=True)  # v2
     data = _enrich_payload(payload, req)
+
     et = (event_type or data.get("event") or "Lead")
     data["event_type"] = et
 
     if not _bridge_dedupe_mark(data.get("event_id")):
-        logger.info(json.dumps({"event":"BRIDGE_DEDUP_SKIP","type":et,"event_id":data.get("event_id")}))
-        return {"status":"duplicate","event_id":data.get("event_id")}
+        logger.info(json.dumps({
+            "event": "BRIDGE_DEDUP_SKIP",
+            "type": et,
+            "event_id": data.get("event_id")
+        }))
+        return {"status": "duplicate", "event_id": data.get("event_id")}
 
-    # Fire-and-forget: save_lead resiliente + send_event_to_all (safe)
-    asyncio.create_task(_safe_background_runner(_save_lead_resilient, data, timeout=BRIDGE_TASK_TIMEOUT, retries=0, tag="save_lead_resilient"))
-    asyncio.create_task(_safe_background_runner(send_event_to_all, data, timeout=BRIDGE_TASK_TIMEOUT, retries=BRIDGE_TASK_RETRY, tag="send_event_to_all"))
+    asyncio.create_task(_maybe_async(save_lead, data))
+    asyncio.create_task(_maybe_async(send_event_to_all, data, et=et))
 
     logger.info(json.dumps({
         "event": "EVENT_SENT",
@@ -976,7 +701,6 @@ async def ingest_event(
         "source_url": data.get("event_source_url"),
     }))
 
-    # Immediate response to avoid client timeouts
     return {"status": "ok", "saved": True, "event_type": et, "event_id": data.get("event_id")}
 
 @app.post("/webhook")
@@ -1032,20 +756,7 @@ async def apply_redirect(req: Request):
 
     data = _enrich_payload(base_payload, req)
     token = _make_token()
-    key = _key(token)
-    blob = json.dumps(data, ensure_ascii=False)
-
-    try:
-        if _redis_client and _redis_available:
-            try:
-                await _run_sync_with_timeout(lambda: _redis_client.setex(key, TOKEN_TTL_SEC, blob), timeout=1.5)
-            except Exception as e:
-                logger.warning(json.dumps({"event":"REDIS_SETEX_FAIL","error":str(e)}))
-                await _inmem_setex(key, TOKEN_TTL_SEC, blob)
-        else:
-            await _inmem_setex(key, TOKEN_TTL_SEC, blob)
-    except Exception as e:
-        logger.exception(json.dumps({"event":"REDIS_SETEX_UNHANDLED","error":str(e)}))
+    redis.setex(_key(token), TOKEN_TTL_SEC, json.dumps(data, ensure_ascii=False))
 
     logger.info(json.dumps({
         "event": "APPLY_REDIRECT",
@@ -1057,35 +768,3 @@ async def apply_redirect(req: Request):
     }))
 
     return RedirectResponse(url=_deep_link(token))
-
-# =============================
-# Periodic maintenance: verifica Redis e faz flush do inmem
-# e monitora DB para flush de leads pendentes
-# =============================
-async def _periodic_maintenance():
-    global _redis_available, _redis_client
-    while True:
-        # tenta reconectar / pingar redis
-        if _redis_client and not _redis_available:
-            try:
-                await _run_sync_with_timeout(_redis_client.ping, timeout=1.0)
-                _redis_available = True
-                logger.info(json.dumps({"event":"REDIS_RECOVERED"}))
-            except Exception:
-                pass
-        # se redis disponível, flush inmem
-        if _redis_client and _redis_available and _inmem_store:
-            try:
-                await _flush_inmem_to_redis()
-            except Exception:
-                pass
-        await asyncio.sleep(5)
-
-@app.on_event("startup")
-async def _on_startup():
-    # inicia tarefas de manutenção periódica e monitor DB
-    asyncio.create_task(_periodic_maintenance())
-    asyncio.create_task(_monitor_db_and_flush())
-    logger.info(json.dumps({"event":"BRIDGE_STARTUP"}))
-
-# fim do arquivo
